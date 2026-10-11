@@ -1,0 +1,7 @@
+name: Example Security Program
+authorized_scope:
+  - "*.example.test"
+excluded_scope:
+  - "admin.example.test"
+rate_limit_per_minute: 30
+max_investigation_hours: 4
