@@ -9,7 +9,7 @@ from gateway.dns_pin import Resolver, URLAuthorizer
 from gateway.lab_mode import pin_lab_url
 from verification.diff_check import DiffResult, build_diff_result
 from verification.evidence import store_diff_evidence
-from verification.http_probe import ProbeResult, _probe_pinned_target, _validate_timeout
+from verification.http_probe import ProbeResult, probe_lab_target, validate_timeout
 from verification.run_verification import VerificationRunResult
 
 
@@ -34,7 +34,7 @@ def run_lab_verification(
     hypothesis = session.get(Hypothesis, hypothesis_id)
     if hypothesis is None:
         raise ValueError(f"Hypothesis with id {hypothesis_id} does not exist")
-    _validate_timeout(timeout_seconds)
+    validate_timeout(timeout_seconds)
 
     target_a = pin_lab_url(
         url_a,
@@ -48,13 +48,15 @@ def run_lab_verification(
         authorize=authorize,
         resolver=resolver,
     )
-    probe_a: ProbeResult = _probe_pinned_target(
+    probe_a: ProbeResult = probe_lab_target(
         target_a,
+        allow_private_network=allow_private_network,
         timeout_seconds=timeout_seconds,
         extra_headers=extra_headers_a,
     )
-    probe_b: ProbeResult = _probe_pinned_target(
+    probe_b: ProbeResult = probe_lab_target(
         target_b,
+        allow_private_network=allow_private_network,
         timeout_seconds=timeout_seconds,
         extra_headers=extra_headers_b,
     )

@@ -54,6 +54,15 @@ class ProbeResponseTooLargeError(ValueError):
     """Raised when a response exceeds the probe's evidence size limit."""
 
 
+class LabProbeNotPermitted(ValueError):
+    """Raised when a lab-only probe is attempted without an explicit lab opt-in.
+
+    This guards the lab transport: it must only ever be reached with both an
+    explicit ``allow_private_network=True`` opt-in and a lab-marked target, so
+    it cannot become a general private-IP request path.
+    """
+
+
 class _RequestDeadline:
     def __init__(self, timeout_seconds: float) -> None:
         self._lock = threading.Lock()
@@ -192,7 +201,7 @@ def _is_timeout_error(error: BaseException) -> bool:
     return False
 
 
-def _validate_timeout(timeout_seconds: float) -> None:
+def validate_timeout(timeout_seconds: float) -> None:
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be a positive finite number")
 
@@ -204,7 +213,7 @@ def _probe_pinned_target(
     extra_headers: dict[str, str] | None,
 ) -> ProbeResult:
     """Send one request using an already-authorized and pinned target."""
-    _validate_timeout(timeout_seconds)
+    validate_timeout(timeout_seconds)
     request_headers = {"Accept-Encoding": "identity", "Connection": "close"}
     for name, value in (extra_headers or {}).items():
         if name.lower() == "host":
@@ -283,8 +292,42 @@ def probe_endpoint(
     extra_headers: dict[str, str] | None = None,
 ) -> ProbeResult:
     """Authorize, pin, and GET once through the normal public-target gateway."""
-    _validate_timeout(timeout_seconds)
+    validate_timeout(timeout_seconds)
     target = dns_pin.pin_url(url, authorize=authorize, resolver=resolver)
+    return _probe_pinned_target(
+        target,
+        timeout_seconds=timeout_seconds,
+        extra_headers=extra_headers,
+    )
+
+
+def probe_lab_target(
+    target: PinnedTarget,
+    *,
+    allow_private_network: bool,
+    timeout_seconds: float = 5.0,
+    extra_headers: dict[str, str] | None = None,
+) -> ProbeResult:
+    """Send one request to an explicitly lab-marked, pre-pinned lab target.
+
+    This is the only supported lab transport and it is intentionally guarded:
+    it requires both an explicit ``allow_private_network=True`` opt-in and a
+    target produced by the lab-only pinning escape hatch (``is_lab_target``).
+    A normal public target, or a caller that forgot the opt-in, is rejected
+    before any request is made, so this cannot widen the public path.
+
+    ``probe_endpoint`` remains the public-only entry point. Both paths share
+    the exact same pinned-transport code, preserving the Host/TLS/pinned-IP
+    invariant in one place.
+    """
+    if allow_private_network is not True:
+        raise LabProbeNotPermitted(
+            "Pass allow_private_network=True to explicitly enable lab probing"
+        )
+    if target.is_lab_target is not True:
+        raise LabProbeNotPermitted(
+            "Lab probing requires a target marked as a lab target"
+        )
     return _probe_pinned_target(
         target,
         timeout_seconds=timeout_seconds,

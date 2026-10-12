@@ -36,6 +36,7 @@ def test_explicit_lab_runner_pins_both_requests_and_stores_evidence(
     engine = init_db("sqlite+pysqlite:///:memory:")
     pinned_calls: list[tuple[str, bool]] = []
     probe_calls: list[str] = []
+    probe_opt_ins: list[bool] = []
 
     def fake_pin_lab_url(
         url: str,
@@ -53,8 +54,14 @@ def test_explicit_lab_runner_pins_both_requests_and_stores_evidence(
             addresses=(ipaddress.ip_address("127.0.0.1"),),
         )
 
-    def fake_probe(target: LabPinnedTarget, **_kwargs: object) -> ProbeResult:
+    def fake_probe(
+        target: LabPinnedTarget,
+        *,
+        allow_private_network: bool,
+        **_kwargs: object,
+    ) -> ProbeResult:
         probe_calls.append(target.url)
+        probe_opt_ins.append(allow_private_network)
         status = 200 if len(probe_calls) == 1 else 403
         body_hash = str(len(probe_calls)) * 64
         return ProbeResult(
@@ -67,7 +74,7 @@ def test_explicit_lab_runner_pins_both_requests_and_stores_evidence(
         )
 
     monkeypatch.setattr(lab_verification, "pin_lab_url", fake_pin_lab_url)
-    monkeypatch.setattr(lab_verification, "_probe_pinned_target", fake_probe)
+    monkeypatch.setattr(lab_verification, "probe_lab_target", fake_probe)
 
     with Session(engine) as session:
         hypothesis = _create_hypothesis(session)
@@ -91,6 +98,7 @@ def test_explicit_lab_runner_pins_both_requests_and_stores_evidence(
             "http://127.0.0.1:3000/rest/basket/1",
             "http://127.0.0.1:3000/rest/basket/1",
         ]
+        assert probe_opt_ins == [True, True]
         stored = session.scalar(
             select(Observation).where(Observation.id == result.observation.id)
         )

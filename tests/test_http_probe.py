@@ -9,8 +9,10 @@ import requests
 
 from gateway import dns_pin
 from gateway.dns_pin import PinnedTarget, TargetRejected
+from gateway.lab_mode import LabPinnedTarget
 from verification import http_probe
 from verification.http_probe import (
+    LabProbeNotPermitted,
     ProbeConnectionError,
     ProbeResponseTooLargeError,
     ProbeResult,
@@ -357,3 +359,82 @@ def test_connection_failure_is_wrapped_and_chained(
 
     assert error.value.__cause__ is failure
     assert session.closed
+
+
+def _lab_target() -> LabPinnedTarget:
+    return LabPinnedTarget(
+        "http://127.0.0.1:3000/rest/products/search?q=apple",
+        "127.0.0.1",
+        3000,
+        (ipaddress.ip_address("127.0.0.1"),),
+    )
+
+
+def test_probe_lab_target_requires_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_creations: list[bool] = []
+    monkeypatch.setattr(
+        http_probe.requests,
+        "Session",
+        lambda: session_creations.append(True),
+    )
+
+    with pytest.raises(LabProbeNotPermitted, match="allow_private_network=True"):
+        http_probe.probe_lab_target(_lab_target(), allow_private_network=False)
+
+    assert session_creations == []
+
+
+def test_probe_lab_target_refuses_a_normal_public_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public_target = PinnedTarget(
+        "https://example.test/",
+        "example.test",
+        443,
+        (ipaddress.ip_address("93.184.216.34"),),
+    )
+    session_creations: list[bool] = []
+    monkeypatch.setattr(
+        http_probe.requests,
+        "Session",
+        lambda: session_creations.append(True),
+    )
+
+    assert public_target.is_lab_target is False
+    with pytest.raises(LabProbeNotPermitted, match="marked as a lab target"):
+        http_probe.probe_lab_target(public_target, allow_private_network=True)
+
+    assert session_creations == []
+
+
+def test_probe_lab_target_sends_one_request_over_the_pinned_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _lab_target()
+    response = FakeResponse()
+    session = FakeSession(response=response)
+    monkeypatch.setattr(http_probe.requests, "Session", lambda: session)
+
+    result = http_probe.probe_lab_target(target, allow_private_network=True)
+
+    assert isinstance(result, ProbeResult)
+    assert result.url == target.url
+    assert list(session.adapters) == ["http://"]
+    adapter = session.adapters["http://"]
+    assert isinstance(adapter, http_probe._PinnedHTTPAdapter)
+    assert adapter._pinned_ip == "127.0.0.1"
+    request_url, request_kwargs = session.get_calls[0]
+    assert request_url == target.url
+    assert request_kwargs["allow_redirects"] is False
+    assert response.closed
+    assert session.closed
+
+
+def test_public_probe_endpoint_still_rejects_non_public_targets() -> None:
+    with pytest.raises(TargetRejected, match="non-public"):
+        http_probe.probe_endpoint(
+            "http://127.0.0.1:3000/",
+            authorize=lambda _: True,
+        )

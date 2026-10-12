@@ -91,6 +91,40 @@ def test_only_explicit_lab_verifier_imports_lab_mode() -> None:
     assert "from gateway.lab_mode import pin_lab_url" in lab_runner
 
 
+def test_lab_transport_api_is_reachable_only_from_the_lab_runner() -> None:
+    repository_root = Path(__file__).parents[1]
+    normal_flow_paths = [
+        *(repository_root / "workers").rglob("*.py"),
+        repository_root / "verification" / "diff_check.py",
+        repository_root / "verification" / "evidence.py",
+        repository_root / "verification" / "run_verification.py",
+    ]
+    violations: list[str] = []
+
+    for source_path in normal_flow_paths:
+        syntax_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        for node in ast.walk(syntax_tree):
+            referenced: list[str] = []
+            if isinstance(node, ast.ImportFrom):
+                referenced.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.Name):
+                referenced.append(node.id)
+            elif isinstance(node, ast.Attribute):
+                referenced.append(node.attr)
+            if "probe_lab_target" in referenced:
+                violations.append(str(source_path.relative_to(repository_root)))
+
+    assert violations == []
+
+    lab_runner = (repository_root / "verification" / "lab_verification.py").read_text(
+        encoding="utf-8"
+    )
+    assert "probe_lab_target" in lab_runner
+    assert "validate_timeout" in lab_runner
+    assert "_probe_pinned_target" not in lab_runner
+    assert "_validate_timeout" not in lab_runner
+
+
 def test_allow_private_network_argument_is_required() -> None:
     with pytest.raises(TypeError):
         pin_lab_url("http://127.0.0.1/", authorize=lambda _: True)  # type: ignore[call-arg]

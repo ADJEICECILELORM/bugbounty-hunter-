@@ -23,12 +23,17 @@ class PinnedTarget:
 
     The HTTP Host header and TLS server name must remain ``hostname``; only
     the socket destination should use one of ``addresses``.
+
+    ``is_lab_target`` marks a target produced by the explicit, manually invoked
+    lab-only escape hatch. Public targets are never lab-marked, so a lab-only
+    transport can refuse a target that did not come from that escape hatch.
     """
 
     url: str
     hostname: str
     port: int
     addresses: tuple[IPAddress, ...]
+    is_lab_target: bool = False
 
 
 def _system_resolver(hostname: str, port: int) -> Iterable[str]:
