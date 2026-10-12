@@ -125,6 +125,7 @@ def test_successful_probe_hashes_body_and_sanitizes_response(
         authorize=authorizer,
         resolver=resolver,
         timeout_seconds=1.25,
+        extra_headers={"Authorization": "Bearer private-test-token"},
     )
 
     assert isinstance(result, ProbeResult)
@@ -141,6 +142,8 @@ def test_successful_probe_hashes_body_and_sanitizes_response(
     assert request_kwargs["allow_redirects"] is False
     assert request_kwargs["stream"] is True
     assert request_kwargs["timeout"] == (1.25, 1.25)
+    assert request_kwargs["headers"]["Authorization"] == "Bearer private-test-token"
+    assert "private-test-token" not in repr(result)
     assert result.url == target.url
     assert result.status_code == 202
     assert result.content_length == len(_RESPONSE_BODY)

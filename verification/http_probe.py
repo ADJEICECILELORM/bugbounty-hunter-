@@ -198,12 +198,22 @@ def probe_endpoint(
     authorize: URLAuthorizer,
     resolver: dns_pin.Resolver | None = None,
     timeout_seconds: float = 5.0,
+    extra_headers: dict[str, str] | None = None,
 ) -> ProbeResult:
     """Pin and GET once, recording sanitized metadata and a body hash only."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be a positive finite number")
 
     target = dns_pin.pin_url(url, authorize=authorize, resolver=resolver)
+    request_headers = {"Accept-Encoding": "identity", "Connection": "close"}
+    for name, value in (extra_headers or {}).items():
+        if name.lower() == "host":
+            raise ValueError("The Host header is controlled by the pinned target")
+        for existing_name in tuple(request_headers):
+            if existing_name.lower() == name.lower():
+                del request_headers[existing_name]
+        request_headers[name] = value
+
     request_deadline = _RequestDeadline(timeout_seconds)
     session = requests.Session()
     session.trust_env = False
@@ -217,7 +227,7 @@ def probe_endpoint(
     try:
         response = session.get(
             target.url,
-            headers={"Accept-Encoding": "identity", "Connection": "close"},
+            headers=request_headers,
             allow_redirects=False,
             stream=True,
             timeout=(timeout_seconds, timeout_seconds),

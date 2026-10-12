@@ -13,6 +13,7 @@ V1 provides program configuration, scope enforcement, safe DNS resolution, passi
 5. `workers.storage.store_observations()` creates or reuses an asset within an investigation and adds observations to the caller's SQLAlchemy session. The caller owns commit and rollback.
 6. `data.models` defines Program, Investigation, Asset, and Observation. `data.db.init_db()` creates the schema and returns an engine.
 7. `verification.http_probe.probe_endpoint()` authorizes and pins a URL, sends one GET directly to the selected pinned IP, and returns status, sanitized/truncated headers, elapsed time, raw response-body byte count, and a SHA-256 hash of those bytes. The raw body is not retained; redirects are not followed; the request has an absolute deadline and a 1 MiB response limit.
+8. `verification.diff_check.compare_requests()` runs two independent authorized probes and reports only deterministic status, body-hash, content-length, and header differences. It does not interpret their security meaning; callers may pass distinct request headers, which are not included in the diff result.
 
 ## Security Boundaries
 
@@ -21,6 +22,7 @@ V1 provides program configuration, scope enforcement, safe DNS resolution, passi
 - New hostname resolution should go through `gateway.resolver.authorized_resolve()`, not call `gateway.dns_pin` directly.
 - `verification.http_probe` uses a per-probe Requests adapter to connect to a `pin_url()`-validated address while preserving the hostname for the HTTP Host header and TLS server name. Any future HTTP client must preserve this invariant; resolving the URL again in the client would reintroduce DNS rebinding risk.
 - Probe evidence omits `Set-Cookie`, `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`; header values are truncated, and only the content-coded body hash and byte count are returned. Response decompression is disabled to keep the hash/length aligned with the body bytes represented by `Content-Length` when present.
+- The deterministic diff layer has no vulnerability, severity, or likelihood conclusions. Extra request headers are used for the probe only and are never copied into comparison evidence.
 - Recon is passive DNS only. The HTTP probe is a single explicit request and does not follow redirects. No port scanning or autonomous actions are part of V1.
 - `programs/example_program.yaml` uses `.test`, a reserved testing domain; it is not a live target configuration.
 
