@@ -6,8 +6,8 @@
 
 - ✅ `gateway/dns_pin.py` + tests — DNS pinning, SSRF protection, redirect validation. **Needs human review of actual file contents before building on top (pending).**
 - ✅ Task 1 — Scope Policy (Layer 1 core)
-- ✅ Tasks 1–6 — Scope Policy, Program Config Loader, Authorized Resolver, Rate Limiter, PostgreSQL Schema, and Passive Recon
-- ⬜ Tasks 7–8
+- ✅ Tasks 1–7 — Scope Policy, Program Config Loader, Authorized Resolver, Rate Limiter, PostgreSQL Schema, Passive Recon, and Storage
+- ⬜ Task 8 — End-to-End V1 Smoke Test
 
 ## Standing practices (apply every session, every tool)
 
