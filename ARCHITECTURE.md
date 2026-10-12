@@ -9,7 +9,7 @@ V1 provides program configuration, scope enforcement, safe DNS resolution, passi
 1. `gateway.program_config.load_program()` loads and validates YAML program metadata and scope patterns.
 2. `gateway.scope_policy.ScopePolicy` canonicalizes exact and `*.` hostname patterns. Exclusions take precedence over all authorizations.
 3. `gateway.resolver.authorized_resolve()` rejects out-of-scope hostnames before delegating to `gateway.dns_pin.pin_url()`. The pinning layer validates the URL, authorizes it again, resolves it, and rejects any non-public answer. The adapter returns one validated IP.
-4. `workers.recon.passive_discover()` calls the authorized resolver before querying A, AAAA, MX, and TXT records through dnspython. It performs DNS lookups only.
+4. `workers.recon.passive_discover()` calls the authorized resolver before querying A, AAAA, MX, and TXT records through dnspython. Each record query consumes one `RateLimiter` allowance; when the allowance is exhausted, recon stops and returns observations already collected. It performs DNS lookups only.
 5. `workers.storage.store_observations()` creates or reuses an asset within an investigation and adds observations to the caller's SQLAlchemy session. The caller owns commit and rollback.
 6. `data.models` defines Program, Investigation, Asset, and Observation. `data.db.init_db()` creates the schema and returns an engine.
 

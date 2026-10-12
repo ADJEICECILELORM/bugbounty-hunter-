@@ -6,6 +6,7 @@
 
 - ✅ `gateway/dns_pin.py` + tests — DNS pinning, SSRF protection, redirect validation. **Needs human review of actual file contents before building on top (pending).**
 - ✅ Tasks 1–8 — Scope Policy, Program Config Loader, Authorized Resolver, Rate Limiter, PostgreSQL Schema, Passive Recon, Storage, and End-to-End Smoke Test
+- ✅ Recon enforces the configured rate limit per DNS record query and preserves partial results when throttled.
 - ⚠️ Live recon against a program-authorized domain has not been run. The example uses the reserved `.test` domain and integration tests mock DNS.
 
 ## Standing practices (apply every session, every tool)

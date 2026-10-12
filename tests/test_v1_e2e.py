@@ -12,6 +12,7 @@ from data.models import Asset, Investigation, Observation, Program
 from gateway import dns_pin
 from gateway.dns_pin import PinnedTarget
 from gateway.program_config import load_program
+from gateway.rate_limiter import RateLimiter
 from gateway.resolver import UnauthorizedTargetError
 from gateway.scope_policy import ScopePolicy
 from workers import recon, storage
@@ -71,7 +72,11 @@ def test_v1_authorized_recon_round_trip(
 
     with Session(engine) as session:
         investigation = _create_investigation(session, config)
-        observations = recon.passive_discover("api.example.test", policy)
+        observations = recon.passive_discover(
+            "api.example.test",
+            policy,
+            RateLimiter(int(config["rate_limit_per_minute"])),
+        )
         storage.store_observations(
             investigation.id,
             "api.example.test",
@@ -121,7 +126,11 @@ def test_v1_excluded_target_never_reaches_dns_or_storage(
     with Session(engine) as session:
         investigation = _create_investigation(session, config)
         with pytest.raises(UnauthorizedTargetError):
-            observations = recon.passive_discover("admin.example.test", policy)
+            observations = recon.passive_discover(
+                "admin.example.test",
+                policy,
+                RateLimiter(int(config["rate_limit_per_minute"])),
+            )
             storage.store_observations(
                 investigation.id,
                 "admin.example.test",

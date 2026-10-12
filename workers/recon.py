@@ -8,6 +8,7 @@ import dns.exception
 import dns.resolver
 
 from gateway.resolver import authorized_resolve
+from gateway.rate_limiter import RateLimiter
 from gateway.scope_policy import ScopePolicy
 
 
@@ -17,12 +18,18 @@ class DNSObservation(TypedDict):
     value: str
 
 
-def passive_discover(hostname: str, policy: ScopePolicy) -> list[DNSObservation]:
+def passive_discover(
+    hostname: str,
+    policy: ScopePolicy,
+    rate_limiter: RateLimiter,
+) -> list[DNSObservation]:
     """Collect public DNS records after verifying scope and pinning the host."""
     authorized_resolve(hostname, policy)
 
     observations: list[DNSObservation] = []
     for record_type in ("A", "AAAA", "MX", "TXT"):
+        if not rate_limiter.allow():
+            break
         try:
             answers = dns.resolver.resolve(hostname, record_type, lifetime=2.0)
         except dns.exception.DNSException:

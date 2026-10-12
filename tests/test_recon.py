@@ -2,6 +2,7 @@ import dns.resolver
 import pytest
 
 from gateway.resolver import UnauthorizedTargetError
+from gateway.rate_limiter import RateLimiter
 from gateway.scope_policy import ScopePolicy
 from workers import recon
 
@@ -35,6 +36,7 @@ def test_authorized_hostname_returns_passive_dns_observations(
     observations = recon.passive_discover(
         "api.example.test",
         ScopePolicy(["*.example.test"]),
+        RateLimiter(4),
     )
 
     assert authorization_calls == ["api.example.test"]
@@ -43,6 +45,37 @@ def test_authorized_hostname_returns_passive_dns_observations(
         {"type": "dns_record", "record_type": record_type, "value": value}
         for record_type, values in expected_records.items()
         for value in values
+    ]
+
+
+def test_rate_limit_stops_dns_queries_and_preserves_partial_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dns_calls: list[str] = []
+    expected_records = {
+        "A": ["93.184.216.34"],
+        "AAAA": ["2001:db8::1"],
+        "MX": ["10 mail.example.test."],
+        "TXT": ['"v=spf1 -all"'],
+    }
+
+    def fake_resolve(_hostname: str, record_type: str, **_kwargs: object) -> list[str]:
+        dns_calls.append(record_type)
+        return expected_records[record_type]
+
+    monkeypatch.setattr(recon, "authorized_resolve", lambda *_args: "93.184.216.34")
+    monkeypatch.setattr(dns.resolver, "resolve", fake_resolve)
+
+    observations = recon.passive_discover(
+        "api.example.test",
+        ScopePolicy(["*.example.test"]),
+        RateLimiter(2),
+    )
+
+    assert dns_calls == ["A", "AAAA"]
+    assert observations == [
+        {"type": "dns_record", "record_type": "A", "value": "93.184.216.34"},
+        {"type": "dns_record", "record_type": "AAAA", "value": "2001:db8::1"},
     ]
 
 
@@ -62,7 +95,11 @@ def test_unauthorized_hostname_raises_before_dns_lookup(
     )
 
     with pytest.raises(UnauthorizedTargetError):
-        recon.passive_discover("outside.test", ScopePolicy(["*.example.test"]))
+        recon.passive_discover(
+            "outside.test",
+            ScopePolicy(["*.example.test"]),
+            RateLimiter(4),
+        )
 
     assert dns_calls == []
 
@@ -81,6 +118,7 @@ def test_missing_dns_record_type_does_not_discard_other_answers(
     observations = recon.passive_discover(
         "api.example.test",
         ScopePolicy(["*.example.test"]),
+        RateLimiter(4),
     )
 
     assert [item["record_type"] for item in observations] == ["A", "MX", "TXT"]
