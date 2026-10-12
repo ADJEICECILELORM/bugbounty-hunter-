@@ -25,6 +25,7 @@ V1 provides program configuration, scope enforcement, safe DNS resolution, passi
 - Probe evidence omits `Set-Cookie`, `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`; header values are truncated, and only the content-coded body hash and byte count are returned. Response decompression is disabled to keep the hash/length aligned with the body bytes represented by `Content-Length` when present.
 - The deterministic diff layer has no vulnerability, severity, or likelihood conclusions. Extra request headers are used for the probe only and are never copied into comparison evidence.
 - `Observation.hypothesis_id` is nullable so passive recon evidence can exist independently; verification evidence is linked to a hypothesis and inherits its asset ID from that hypothesis.
+- `gateway.lab_mode.pin_lab_url()` is a standalone manual lab-only escape hatch. It requires the explicit `allow_private_network=True` argument, still enforces URL authorization, and returns a `LabPinnedTarget` marked `is_lab_target=True`. Normal workers and verification modules must not import it.
 - Recon is passive DNS only. The HTTP probe is a single explicit request and does not follow redirects. No port scanning or autonomous actions are part of V1.
 - `programs/example_program.yaml` uses `.test`, a reserved testing domain; it is not a live target configuration.
 
