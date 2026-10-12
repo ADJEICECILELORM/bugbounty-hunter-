@@ -37,3 +37,7 @@ python -m pytest -q
 ```
 
 The V1 end-to-end test mocks the pinning and DNS boundaries and uses in-memory SQLite. Before live use, a human must review `gateway/dns_pin.py` and configure only program-authorized domains.
+
+## Intelligence API Configuration
+
+`intelligence.llm_client` is dormant infrastructure and is not imported by any investigation flow. If called directly, it requires `DEEPSEEK_API_KEY` from the process environment. Provide the key through a local secret manager or environment configuration; never commit the key to this repository.
