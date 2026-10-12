@@ -5,8 +5,8 @@ Use `ARCHITECTURE.md` for the current module/data flow and `NEXT_STEPS.md` for t
 ## Current Checkpoint
 
 - Branch: `main`
-- Last verified code commit: `c7bb2b7` (`Extract guarded lab-only probe transport API`); current HEAD is `716d2cc` (`Stop tracking ignored bytecode caches`).
-- The worktree is clean and `origin/main` is pushed to match this handoff.
+- Last verified code commit: `c7bb2b7` (`Extract guarded lab-only probe transport API`), followed by the bytecode-cache hygiene commit `716d2cc` and this handoff update.
+- The worktree is clean and `origin/main` matches the pushed history.
 - Last full test run: 85 passed after the lab transport API cleanup (+5 tests over the previous 80).
 
 ## Project Goal
