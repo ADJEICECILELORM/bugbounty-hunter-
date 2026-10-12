@@ -65,6 +65,7 @@ All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-
 - ✅ Human-initiated verification: `verification/run_verification.py` performs one comparison and evidence write without changing hypothesis status or committing.
 - ✅ Manual local-lab adapter: `verification/lab_verification.py` requires `allow_private_network=True` for each run and remains separate from normal investigation flows.
 - ✅ Live local-lab smoke run: two read-only GETs to Juice Shop's `/rest/products/search?q=apple` returned HTTP 200 with matching hashes; a `diff_check` observation was stored in in-memory SQLite while the hypothesis remained `unverified`.
+- ⚠️ Cleanup debt: `verification/lab_verification.py` calls private helpers in `verification/http_probe.py`. Before adding another caller, extract a stable lab-only transport API that requires a lab-marked target and cannot become a general private-IP bypass; do not simply expose an unrestricted pre-pinned-target request function.
 - ✅ Dormant Layer 8 client: `intelligence/llm_client.py` returns text suggestions only and has no investigation-flow callers; target-originated context is explicitly marked untrusted and bounded.
 - ⚠️ Broader or authenticated verification still requires an explicitly approved target and test accounts; this smoke run tested only a public read-only lab endpoint.
 
