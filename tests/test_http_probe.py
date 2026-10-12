@@ -46,8 +46,8 @@ class FakeRaw:
     def __init__(self, body: bytes) -> None:
         self.body = body
 
-    def stream(self, *, chunk_size: int, decode_content: bool):
-        assert chunk_size == 64 * 1024
+    def stream(self, amt: int, decode_content: bool):
+        assert amt == 64 * 1024
         assert decode_content is False
         yield self.body
 

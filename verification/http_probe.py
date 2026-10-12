@@ -235,7 +235,7 @@ def _probe_pinned_target(
         body_hash = hashlib.sha256()
         content_length = 0
         for chunk in response.raw.stream(
-            chunk_size=_BODY_READ_SIZE,
+            _BODY_READ_SIZE,
             decode_content=False,
         ):
             if not chunk:
