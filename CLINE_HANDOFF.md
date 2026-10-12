@@ -5,9 +5,9 @@ Use `ARCHITECTURE.md` for the current module/data flow and `NEXT_STEPS.md` for t
 ## Current Checkpoint
 
 - Branch: `main`
-- Last verified commit: `55200eb` (`Record lab transport API cleanup debt`)
-- At handoff creation, the worktree was clean and `origin/main` matched.
-- Last full test run: 80 passed after the real lab smoke test and urllib3 stream fix. The only later change was this documentation handoff.
+- Last verified code commit: `c7bb2b7` (`Extract guarded lab-only probe transport API`); current HEAD is `716d2cc` (`Stop tracking ignored bytecode caches`).
+- The worktree is clean and `origin/main` is pushed to match this handoff.
+- Last full test run: 85 passed after the lab transport API cleanup (+5 tests over the previous 80).
 
 ## Project Goal
 
@@ -21,7 +21,7 @@ Build Project 001 as a persistent, policy-governed bug bounty research system, i
 - `verification/evidence.py` stores an explicit allowlist of diff/probe fields against a hypothesis and derives `asset_id` from that hypothesis.
 - `verification/run_verification.py` is a single-shot human-invoked flow. It fails fast on missing hypotheses, stores evidence, never changes hypothesis status, and never commits the caller's session.
 - `gateway/lab_mode.py` is an explicit private-network pinning escape hatch. It requires `allow_private_network=True`, still invokes the authorizer, returns `LabPinnedTarget(is_lab_target=True)`, and is not imported by normal workers or public verification paths.
-- `verification/lab_verification.py` is the separate manual lab flow.
+- `verification/lab_verification.py` is the separate manual lab flow; it probes through the guarded `verification/http_probe.probe_lab_target()` lab transport (see below).
 - `intelligence/llm_client.py` is dormant, API-only DeepSeek infrastructure. It reads `DEEPSEEK_API_KEY` from the environment, bounds and marks untrusted target text, returns text only, and has no investigation-flow callers. Do not wire it into a live flow yet.
 
 ## Live Lab Check
@@ -32,13 +32,13 @@ A real, read-only lab smoke run compared `http://127.0.0.1:3000/rest/products/se
 
 That live run found and fixed an urllib3 API mismatch: call `response.raw.stream(_BODY_READ_SIZE, decode_content=False)` with the byte amount positional. Keep raw content-coded hashing, the deadline, and the 1 MiB cap.
 
-## Known Cleanup Debt
+## Lab Transport API Cleanup (resolved)
 
-`verification/lab_verification.py` currently imports private `_probe_pinned_target` and `_validate_timeout` helpers from `verification/http_probe.py`. This works but couples the lab flow to internals. Refactor before adding more callers. Do **not** simply expose an unrestricted pre-pinned-target request function: it could bypass normal authorization/public-IP checks. A replacement must remain explicitly lab-only, require a lab-marked target and explicit opt-in, preserve the Host/TLS/pinned-IP invariant, and leave `probe_endpoint()` / `run_verification()` on the public-only gateway path. Extend the isolation tests accordingly.
+Resolved in `c7bb2b7`. `verification/lab_verification.py` no longer imports the private `_probe_pinned_target` / `_validate_timeout` helpers. It now uses the stable, guarded `verification.http_probe.probe_lab_target()` (plus the public `validate_timeout`). That transport requires both `allow_private_network=True` and a target marked `is_lab_target=True` (a new `PinnedTarget` field that defaults to `False`, so public targets can never satisfy it), then delegates to the same private pinned transport used by `probe_endpoint()`. It therefore cannot become a general private-IP request path, and `probe_endpoint()` / `run_verification()` remain public-only. Isolation tests assert the lab transport is reachable only from `lab_verification.py` and that `probe_endpoint()` still rejects non-public targets.
 
 ## Next Work
 
-1. Resolve the lab transport API coupling as a small, reviewed change; preserve isolation and run both normal and lab-path tests.
+1. ✅ Resolved in `c7bb2b7` (guarded `probe_lab_target()` lab transport). Normal-path, lab-path, and full-suite tests all pass.
 2. If the user explicitly chooses to proceed, create two local Juice Shop test accounts and keep credentials only in memory/environment. Do not log or persist tokens. Use a specific user-approved endpoint/hypothesis; do not assume an IDOR exists or probe unrelated targets.
 3. Run one comparison with distinct account headers through the lab-only flow, inspect sanitized diff evidence, and leave the hypothesis status unchanged for human review.
 4. Only after the user approves, consider the separate hypothesis-generation module. The LLM remains dormant; target-originated text stays untrusted and must never trigger tools or writes directly.
