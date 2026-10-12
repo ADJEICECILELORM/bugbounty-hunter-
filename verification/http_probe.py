@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
 import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -11,7 +12,8 @@ from urllib.parse import urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.connection import HTTPConnection, HTTPSConnection
-from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
+from urllib3.exceptions import ConnectTimeoutError, HTTPError as Urllib3HTTPError
+from urllib3.exceptions import NewConnectionError
 from urllib3.exceptions import TimeoutError as Urllib3TimeoutError
 from urllib3.util import connection as urllib3_connection
 
@@ -27,6 +29,7 @@ _SENSITIVE_RESPONSE_HEADERS = {
 }
 _MAX_HEADER_VALUE_LENGTH = 2000
 _BODY_READ_SIZE = 64 * 1024
+_MAX_BODY_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -47,22 +50,85 @@ class ProbeConnectionError(ConnectionError):
     """Raised when the HTTP probe cannot complete its request."""
 
 
+class ProbeResponseTooLargeError(ValueError):
+    """Raised when a response exceeds the probe's evidence size limit."""
+
+
+class _RequestDeadline:
+    def __init__(self, timeout_seconds: float) -> None:
+        self._lock = threading.Lock()
+        self._expired = False
+        self._connections: set[HTTPConnection] = set()
+        self._timer = threading.Timer(timeout_seconds, self._expire)
+        self._timer.daemon = True
+
+    @property
+    def expired(self) -> bool:
+        with self._lock:
+            return self._expired
+
+    @property
+    def remaining_seconds(self) -> float:
+        return self._timer.interval - (time.monotonic() - self._started_at)
+
+    def start(self) -> None:
+        self._started_at = time.monotonic()
+        self._timer.start()
+
+    def register(self, connection: HTTPConnection, sock: object) -> None:
+        with self._lock:
+            if self._expired:
+                sock.close()
+                raise TimeoutError("HTTP probe deadline expired")
+            connection.sock = sock
+            self._connections.add(connection)
+
+    def _expire(self) -> None:
+        with self._lock:
+            self._expired = True
+            sockets = [connection.sock for connection in self._connections]
+        for sock in sockets:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+
+
 class _PinnedConnectionMixin:
     _pinned_ip: str
+    _request_deadline: _RequestDeadline
 
-    def __init__(self, *args: object, pinned_ip: str, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *args: object,
+        pinned_ip: str,
+        request_deadline: _RequestDeadline,
+        **kwargs: object,
+    ) -> None:
         self._pinned_ip = pinned_ip
+        self._request_deadline = request_deadline
         super().__init__(*args, **kwargs)
 
     def _new_conn(self):
         connect_timeout = getattr(self.timeout, "connect_timeout", self.timeout)
+        remaining = self._request_deadline.remaining_seconds
+        if remaining <= 0:
+            raise ConnectTimeoutError(self, "HTTP probe deadline expired")
+        if connect_timeout is None or connect_timeout > remaining:
+            connect_timeout = remaining
         try:
-            return urllib3_connection.create_connection(
+            sock = urllib3_connection.create_connection(
                 (self._pinned_ip, self.port),
                 connect_timeout,
                 source_address=self.source_address,
                 socket_options=self.socket_options,
             )
+            self._request_deadline.register(self, sock)
+            return sock
         except TimeoutError as error:
             raise ConnectTimeoutError(
                 self,
@@ -84,9 +150,15 @@ class _PinnedHTTPSConnection(_PinnedConnectionMixin, HTTPSConnection):
 
 
 class _PinnedHTTPAdapter(HTTPAdapter):
-    def __init__(self, target: PinnedTarget, pinned_ip: IPAddress) -> None:
+    def __init__(
+        self,
+        target: PinnedTarget,
+        pinned_ip: IPAddress,
+        request_deadline: _RequestDeadline,
+    ) -> None:
         self._target = target
         self._pinned_ip = str(pinned_ip)
+        self._request_deadline = request_deadline
         super().__init__(max_retries=0)
 
     def get_connection_with_tls_context(
@@ -107,6 +179,7 @@ class _PinnedHTTPAdapter(HTTPAdapter):
             else _PinnedHTTPConnection
         )
         pool.conn_kw["pinned_ip"] = self._pinned_ip
+        pool.conn_kw["request_deadline"] = self._request_deadline
         return pool
 
 
@@ -131,14 +204,16 @@ def probe_endpoint(
         raise ValueError("timeout_seconds must be a positive finite number")
 
     target = dns_pin.pin_url(url, authorize=authorize, resolver=resolver)
+    request_deadline = _RequestDeadline(timeout_seconds)
     session = requests.Session()
     session.trust_env = False
     session.mount(
         f"{urlsplit(target.url).scheme}://",
-        _PinnedHTTPAdapter(target, target.addresses[0]),
+        _PinnedHTTPAdapter(target, target.addresses[0], request_deadline),
     )
     response = None
     started_at = time.perf_counter()
+    request_deadline.start()
     try:
         response = session.get(
             target.url,
@@ -149,9 +224,16 @@ def probe_endpoint(
         )
         body_hash = hashlib.sha256()
         content_length = 0
-        for chunk in response.iter_content(chunk_size=_BODY_READ_SIZE):
+        for chunk in response.raw.stream(
+            chunk_size=_BODY_READ_SIZE,
+            decode_content=False,
+        ):
             if not chunk:
                 continue
+            if content_length + len(chunk) > _MAX_BODY_BYTES:
+                raise ProbeResponseTooLargeError(
+                    f"HTTP response exceeds {_MAX_BODY_BYTES} bytes"
+                )
             body_hash.update(chunk)
             content_length += len(chunk)
 
@@ -171,11 +253,12 @@ def probe_endpoint(
         )
     except requests.Timeout as error:
         raise ProbeTimeoutError("HTTP probe timed out") from error
-    except requests.RequestException as error:
-        if _is_timeout_error(error):
+    except (requests.RequestException, Urllib3HTTPError, OSError) as error:
+        if request_deadline.expired or _is_timeout_error(error):
             raise ProbeTimeoutError("HTTP probe timed out") from error
         raise ProbeConnectionError("HTTP probe connection failed") from error
     finally:
+        request_deadline.cancel()
         if response is not None:
             response.close()
         session.close()

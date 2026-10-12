@@ -1,5 +1,7 @@
 import hashlib
+import gzip
 import ipaddress
+import threading
 from typing import Any
 
 import pytest
@@ -8,7 +10,12 @@ import requests
 from gateway import dns_pin
 from gateway.dns_pin import PinnedTarget, TargetRejected
 from verification import http_probe
-from verification.http_probe import ProbeConnectionError, ProbeResult, ProbeTimeoutError
+from verification.http_probe import (
+    ProbeConnectionError,
+    ProbeResponseTooLargeError,
+    ProbeResult,
+    ProbeTimeoutError,
+)
 
 _RESPONSE_BODY = b"probe response"
 _LONG_HEADER_VALUE = "x" * 2001
@@ -26,15 +33,31 @@ class FakeResponse:
         "X-Large": _LONG_HEADER_VALUE,
     }
 
-    def __init__(self) -> None:
+    def __init__(self, body: bytes = _RESPONSE_BODY, headers: dict[str, str] | None = None) -> None:
         self.closed = False
-
-    def iter_content(self, chunk_size: int):
-        assert chunk_size == 64 * 1024
-        yield _RESPONSE_BODY
+        self.headers = dict(type(self).headers if headers is None else headers)
+        self.raw = FakeRaw(body)
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeRaw:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def stream(self, *, chunk_size: int, decode_content: bool):
+        assert chunk_size == 64 * 1024
+        assert decode_content is False
+        yield self.body
+
+
+class FakeClosableSocket:
+    def __init__(self) -> None:
+        self.closed = threading.Event()
+
+    def close(self) -> None:
+        self.closed.set()
 
 
 class FakeSession:
@@ -58,6 +81,21 @@ class FakeSession:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeDeadlineSession(FakeSession):
+    def __init__(self, active_socket: FakeClosableSocket) -> None:
+        super().__init__()
+        self.active_socket = active_socket
+
+    def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.get_calls.append((url, kwargs))
+        adapter = self.adapters["https://"]
+        connection = type("ActiveConnection", (), {"sock": None})()
+        adapter._request_deadline.register(connection, self.active_socket)
+        if not self.active_socket.closed.wait(timeout=1):
+            raise AssertionError("request deadline did not close the active socket")
+        raise requests.ConnectionError("socket closed by request deadline")
 
 
 def test_successful_probe_hashes_body_and_sanitizes_response(
@@ -142,7 +180,9 @@ def test_adapter_connects_to_pinned_ip_but_keeps_hostname_for_tls(
         "create_connection",
         fake_create_connection,
     )
-    adapter = http_probe._PinnedHTTPAdapter(target, target.addresses[0])
+    deadline = http_probe._RequestDeadline(1.0)
+    deadline.start()
+    adapter = http_probe._PinnedHTTPAdapter(target, target.addresses[0], deadline)
     prepared_request = requests.Request("GET", target.url).prepare()
     pool = adapter.get_connection_with_tls_context(prepared_request, verify=True, proxies={})
     connection = pool._new_conn()
@@ -152,6 +192,7 @@ def test_adapter_connects_to_pinned_ip_but_keeps_hostname_for_tls(
     assert connection.host == "example.test"
     assert connection._pinned_ip == "93.184.216.34"
     assert pool.ConnectionCls is http_probe._PinnedHTTPSConnection
+    deadline.cancel()
     adapter.close()
 
 
@@ -221,6 +262,76 @@ def test_wrapped_read_timeout_is_reported_as_probe_timeout(
         http_probe.probe_endpoint(target.url, authorize=lambda _: True)
 
     assert error.value.__cause__ is request_error
+    assert session.closed
+
+
+def test_absolute_deadline_closes_active_request_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = PinnedTarget(
+        "https://example.test/",
+        "example.test",
+        443,
+        (ipaddress.ip_address("93.184.216.34"),),
+    )
+    active_socket = FakeClosableSocket()
+    session = FakeDeadlineSession(active_socket)
+    monkeypatch.setattr(dns_pin, "pin_url", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(http_probe.requests, "Session", lambda: session)
+
+    with pytest.raises(ProbeTimeoutError):
+        http_probe.probe_endpoint(
+            target.url,
+            authorize=lambda _: True,
+            timeout_seconds=0.01,
+        )
+
+    assert active_socket.closed.is_set()
+    assert session.closed
+
+
+def test_probe_hashes_content_encoded_bytes_without_decompressing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = PinnedTarget(
+        "https://example.test/",
+        "example.test",
+        443,
+        (ipaddress.ip_address("93.184.216.34"),),
+    )
+    compressed_body = gzip.compress(b"decoded response body")
+    headers = {
+        "Content-Length": str(len(compressed_body)),
+        "Content-Encoding": "gzip",
+    }
+    response = FakeResponse(compressed_body, headers)
+    session = FakeSession(response=response)
+    monkeypatch.setattr(dns_pin, "pin_url", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(http_probe.requests, "Session", lambda: session)
+
+    result = http_probe.probe_endpoint(target.url, authorize=lambda _: True)
+
+    assert result.content_length == len(compressed_body)
+    assert result.headers["content-length"] == str(len(compressed_body))
+    assert result.body_sha256 == hashlib.sha256(compressed_body).hexdigest()
+
+
+def test_response_over_size_limit_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = PinnedTarget(
+        "https://example.test/",
+        "example.test",
+        443,
+        (ipaddress.ip_address("93.184.216.34"),),
+    )
+    response = FakeResponse(b"x" * (http_probe._MAX_BODY_BYTES + 1))
+    session = FakeSession(response=response)
+    monkeypatch.setattr(dns_pin, "pin_url", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(http_probe.requests, "Session", lambda: session)
+
+    with pytest.raises(ProbeResponseTooLargeError, match="exceeds"):
+        http_probe.probe_endpoint(target.url, authorize=lambda _: True)
+
+    assert response.closed
     assert session.closed
 
 

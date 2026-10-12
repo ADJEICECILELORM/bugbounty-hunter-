@@ -59,7 +59,7 @@ All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-
 
 ## Controlled Verification Progress
 
-- ✅ First building block: `verification/http_probe.py` sends one authorized GET over a pinned IP, preserves the hostname for Host/TLS, does not follow redirects, hashes the response body without retaining it, strips sensitive headers, and truncates long header values.
+- ✅ First building block: `verification/http_probe.py` sends one authorized GET over a pinned IP, preserves the hostname for Host/TLS, does not follow redirects, enforces an absolute deadline and 1 MiB body limit, hashes raw content-coded bytes without retaining them, strips sensitive headers, and truncates long header values.
 - ⚠️ Probe tests mock the transport. A live request must wait for human review and an explicitly authorized target.
 
 ## After V1
