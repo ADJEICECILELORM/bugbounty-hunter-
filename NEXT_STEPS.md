@@ -62,6 +62,7 @@ All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-
 - ✅ First building block: `verification/http_probe.py` sends one authorized GET over a pinned IP, preserves the hostname for Host/TLS, does not follow redirects, enforces an absolute deadline and 1 MiB body limit, hashes raw content-coded bytes without retaining them, strips sensitive headers, and truncates long header values.
 - ✅ Deterministic comparison: `verification/diff_check.py` compares two independently authorized probes by status, body hash, length, and sanitized headers without making vulnerability judgments.
 - ✅ Evidence persistence: `verification/evidence.py` stores explicit allowlisted diff/probe fields as an observation linked to an unverified hypothesis and its asset.
+- ✅ Human-initiated verification: `verification/run_verification.py` performs one comparison and evidence write without changing hypothesis status or committing.
 - ✅ Dormant Layer 8 client: `intelligence/llm_client.py` returns text suggestions only and has no investigation-flow callers; target-originated context is explicitly marked untrusted and bounded.
 - ⚠️ Probe tests mock the transport. A live request must wait for human review and an explicitly authorized target.
 
