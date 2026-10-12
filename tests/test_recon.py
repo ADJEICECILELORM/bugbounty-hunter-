@@ -48,7 +48,7 @@ def test_authorized_hostname_returns_passive_dns_observations(
     ]
 
 
-def test_rate_limit_stops_dns_queries_and_preserves_partial_results(
+def test_rate_limit_stops_scan_early_with_partial_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dns_calls: list[str] = []
