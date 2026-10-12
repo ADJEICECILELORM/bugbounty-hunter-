@@ -192,19 +192,19 @@ def _is_timeout_error(error: BaseException) -> bool:
     return False
 
 
-def probe_endpoint(
-    url: str,
-    *,
-    authorize: URLAuthorizer,
-    resolver: dns_pin.Resolver | None = None,
-    timeout_seconds: float = 5.0,
-    extra_headers: dict[str, str] | None = None,
-) -> ProbeResult:
-    """Pin and GET once, recording sanitized metadata and a body hash only."""
+def _validate_timeout(timeout_seconds: float) -> None:
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be a positive finite number")
 
-    target = dns_pin.pin_url(url, authorize=authorize, resolver=resolver)
+
+def _probe_pinned_target(
+    target: PinnedTarget,
+    *,
+    timeout_seconds: float,
+    extra_headers: dict[str, str] | None,
+) -> ProbeResult:
+    """Send one request using an already-authorized and pinned target."""
+    _validate_timeout(timeout_seconds)
     request_headers = {"Accept-Encoding": "identity", "Connection": "close"}
     for name, value in (extra_headers or {}).items():
         if name.lower() == "host":
@@ -272,3 +272,21 @@ def probe_endpoint(
         if response is not None:
             response.close()
         session.close()
+
+
+def probe_endpoint(
+    url: str,
+    *,
+    authorize: URLAuthorizer,
+    resolver: dns_pin.Resolver | None = None,
+    timeout_seconds: float = 5.0,
+    extra_headers: dict[str, str] | None = None,
+) -> ProbeResult:
+    """Authorize, pin, and GET once through the normal public-target gateway."""
+    _validate_timeout(timeout_seconds)
+    target = dns_pin.pin_url(url, authorize=authorize, resolver=resolver)
+    return _probe_pinned_target(
+        target,
+        timeout_seconds=timeout_seconds,
+        extra_headers=extra_headers,
+    )

@@ -16,6 +16,7 @@ V1 provides program configuration, scope enforcement, safe DNS resolution, passi
 8. `verification.diff_check.compare_requests()` runs two independent authorized probes and reports only deterministic status, body-hash, content-length, and header differences. It does not interpret their security meaning; callers may pass distinct request headers, which are not included in the diff result.
 9. `verification.evidence.store_diff_evidence()` links an allowlisted diff result to a `Hypothesis` and its `Asset` via the hypothesis relationship. Hypotheses remain unverified by default; storing evidence does not classify a vulnerability.
 10. `verification.run_verification.run_verification()` is a human-initiated, single-shot composition of hypothesis lookup, two-probe comparison, and evidence persistence. It never changes hypothesis status or commits the caller's transaction.
+11. `verification.lab_verification.run_lab_verification()` is a separate manual-only path that explicitly opts into `pin_lab_url()` for both targets and reuses the same pinned HTTP transport, diff builder, and evidence writer. It is not called by `run_verification()`, workers, or recon.
 
 ## Security Boundaries
 

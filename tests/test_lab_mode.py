@@ -58,26 +58,37 @@ def test_lab_mode_still_enforces_scope_before_resolution() -> None:
     assert resolver_calls == []
 
 
-def test_normal_workers_and_verification_never_import_lab_mode() -> None:
+def test_only_explicit_lab_verifier_imports_lab_mode() -> None:
     repository_root = Path(__file__).parents[1]
+    normal_flow_paths = [
+        *(repository_root / "workers").rglob("*.py"),
+        repository_root / "verification" / "http_probe.py",
+        repository_root / "verification" / "diff_check.py",
+        repository_root / "verification" / "evidence.py",
+        repository_root / "verification" / "run_verification.py",
+    ]
     violations: list[str] = []
 
-    for package in ("workers", "verification"):
-        for source_path in (repository_root / package).rglob("*.py"):
-            syntax_tree = ast.parse(source_path.read_text(encoding="utf-8"))
-            for node in ast.walk(syntax_tree):
-                imported_modules: list[str] = []
-                if isinstance(node, ast.ImportFrom) and node.module:
-                    imported_modules.append(node.module)
-                elif isinstance(node, ast.Import):
-                    imported_modules.extend(alias.name for alias in node.names)
-                if any(
-                    module == "gateway.lab_mode" or module.startswith("gateway.lab_mode.")
-                    for module in imported_modules
-                ):
-                    violations.append(str(source_path.relative_to(repository_root)))
+    for source_path in normal_flow_paths:
+        syntax_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        for node in ast.walk(syntax_tree):
+            imported_modules: list[str] = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.append(node.module)
+            elif isinstance(node, ast.Import):
+                imported_modules.extend(alias.name for alias in node.names)
+            if any(
+                module == "gateway.lab_mode" or module.startswith("gateway.lab_mode.")
+                for module in imported_modules
+            ):
+                violations.append(str(source_path.relative_to(repository_root)))
 
     assert violations == []
+
+    lab_runner = (repository_root / "verification" / "lab_verification.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from gateway.lab_mode import pin_lab_url" in lab_runner
 
 
 def test_allow_private_network_argument_is_required() -> None:

@@ -26,6 +26,35 @@ def _casefold_headers(headers: dict[str, str]) -> dict[str, str]:
     return {name.lower(): value for name, value in headers.items()}
 
 
+def build_diff_result(
+    url_a: str,
+    url_b: str,
+    probe_a: ProbeResult,
+    probe_b: ProbeResult,
+) -> DiffResult:
+    """Compute deterministic differences from two already-completed probes."""
+    headers_a = _casefold_headers(probe_a.headers)
+    headers_b = _casefold_headers(probe_b.headers)
+    header_differences = {
+        name: (headers_a.get(name), headers_b.get(name))
+        for name in sorted(headers_a.keys() | headers_b.keys())
+        if headers_a.get(name) != headers_b.get(name)
+    }
+
+    return DiffResult(
+        url_a=url_a,
+        url_b=url_b,
+        status_match=probe_a.status_code == probe_b.status_code,
+        status_a=probe_a.status_code,
+        status_b=probe_b.status_code,
+        body_match=probe_a.body_sha256 == probe_b.body_sha256,
+        content_length_delta=abs(probe_a.content_length - probe_b.content_length),
+        header_differences=header_differences,
+        probe_a=probe_a,
+        probe_b=probe_b,
+    )
+
+
 def compare_requests(
     url_a: str,
     url_b: str,
@@ -52,23 +81,4 @@ def compare_requests(
         extra_headers=extra_headers_b,
     )
 
-    headers_a = _casefold_headers(probe_a.headers)
-    headers_b = _casefold_headers(probe_b.headers)
-    header_differences = {
-        name: (headers_a.get(name), headers_b.get(name))
-        for name in sorted(headers_a.keys() | headers_b.keys())
-        if headers_a.get(name) != headers_b.get(name)
-    }
-
-    return DiffResult(
-        url_a=url_a,
-        url_b=url_b,
-        status_match=probe_a.status_code == probe_b.status_code,
-        status_a=probe_a.status_code,
-        status_b=probe_b.status_code,
-        body_match=probe_a.body_sha256 == probe_b.body_sha256,
-        content_length_delta=abs(probe_a.content_length - probe_b.content_length),
-        header_differences=header_differences,
-        probe_a=probe_a,
-        probe_b=probe_b,
-    )
+    return build_diff_result(url_a, url_b, probe_a, probe_b)

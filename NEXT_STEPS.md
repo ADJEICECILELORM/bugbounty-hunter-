@@ -63,6 +63,8 @@ All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-
 - ✅ Deterministic comparison: `verification/diff_check.py` compares two independently authorized probes by status, body hash, length, and sanitized headers without making vulnerability judgments.
 - ✅ Evidence persistence: `verification/evidence.py` stores explicit allowlisted diff/probe fields as an observation linked to an unverified hypothesis and its asset.
 - ✅ Human-initiated verification: `verification/run_verification.py` performs one comparison and evidence write without changing hypothesis status or committing.
+- ✅ Manual local-lab adapter: `verification/lab_verification.py` requires `allow_private_network=True` for each run and remains separate from normal investigation flows.
+- ⚠️ Docker/Podman is not installed in this environment, so Juice Shop was not started and no live lab requests were made.
 - ✅ Dormant Layer 8 client: `intelligence/llm_client.py` returns text suggestions only and has no investigation-flow callers; target-originated context is explicitly marked untrusted and bounded.
 - ⚠️ Probe tests mock the transport. A live request must wait for human review and an explicitly authorized target.
 
