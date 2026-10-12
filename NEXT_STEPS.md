@@ -5,9 +5,8 @@
 ## Status so far
 
 - ✅ `gateway/dns_pin.py` + tests — DNS pinning, SSRF protection, redirect validation. **Needs human review of actual file contents before building on top (pending).**
-- ✅ Task 1 — Scope Policy (Layer 1 core)
-- ✅ Tasks 1–7 — Scope Policy, Program Config Loader, Authorized Resolver, Rate Limiter, PostgreSQL Schema, Passive Recon, and Storage
-- ⬜ Task 8 — End-to-End V1 Smoke Test
+- ✅ Tasks 1–8 — Scope Policy, Program Config Loader, Authorized Resolver, Rate Limiter, PostgreSQL Schema, Passive Recon, Storage, and End-to-End Smoke Test
+- ⚠️ Live recon against a program-authorized domain has not been run. The example uses the reserved `.test` domain and integration tests mock DNS.
 
 ## Standing practices (apply every session, every tool)
 
@@ -55,7 +54,7 @@
 
 ## V1 complete when
 
-All 8 tasks pass, `test_v1_e2e.py` is green, and you can manually run: load a program → create an investigation → run recon against an authorized test domain → see observations land in the database. That's the real "V1 works" proof, not individual unit tests alone.
+All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-authorized domain remains unverified; review `gateway/dns_pin.py` and replace the reserved `.test` example with verified scope before live use.
 
 ## After V1
 

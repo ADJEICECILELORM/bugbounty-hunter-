@@ -25,9 +25,9 @@ class RateLimiter:
 
     def allow(self) -> bool:
         """Return whether another request fits in the current sliding window."""
-        now = time.monotonic()
-        cutoff = now - self._WINDOW_SECONDS
         with self._lock:
+            now = time.monotonic()
+            cutoff = now - self._WINDOW_SECONDS
             while self._requests and self._requests[0] <= cutoff:
                 self._requests.popleft()
             if len(self._requests) >= self._limit:
