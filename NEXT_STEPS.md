@@ -57,6 +57,11 @@
 
 All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-authorized domain remains unverified; review `gateway/dns_pin.py` and replace the reserved `.test` example with verified scope before live use.
 
+## Controlled Verification Progress
+
+- ✅ First building block: `verification/http_probe.py` sends one authorized GET over a pinned IP, preserves the hostname for Host/TLS, does not follow redirects or read the response body, and removes sensitive response headers.
+- ⚠️ Probe tests mock the transport. A live request must wait for human review and an explicitly authorized target.
+
 ## After V1
 
 Per your roadmap, V2 is investigation intelligence (endpoint inventory, hypothesis generation) — but per Kimi's earlier point, consider swapping to **controlled verification** (V3 concepts) before hypothesis generation, since that's the harder and more valuable piece to get right early.
