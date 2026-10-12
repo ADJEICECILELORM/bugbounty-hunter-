@@ -63,6 +63,27 @@ class Asset(Base):
     observations: Mapped[list[Observation]] = relationship(
         back_populates="asset", cascade="all, delete-orphan"
     )
+    hypotheses: Mapped[list[Hypothesis]] = relationship(
+        back_populates="asset", cascade="all, delete-orphan"
+    )
+
+
+class Hypothesis(Base):
+    __tablename__ = "hypotheses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(String(1000), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="unverified", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    asset: Mapped[Asset] = relationship(back_populates="hypotheses")
+    observations: Mapped[list[Observation]] = relationship(
+        back_populates="hypothesis", cascade="all, delete-orphan"
+    )
 
 
 class Observation(Base):
@@ -70,6 +91,9 @@ class Observation(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), nullable=False)
+    hypothesis_id: Mapped[int | None] = mapped_column(
+        ForeignKey("hypotheses.id"), nullable=True
+    )
     observation_type: Mapped[str] = mapped_column(String(64), nullable=False)
     data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -77,3 +101,4 @@ class Observation(Base):
     )
 
     asset: Mapped[Asset] = relationship(back_populates="observations")
+    hypothesis: Mapped[Hypothesis | None] = relationship(back_populates="observations")

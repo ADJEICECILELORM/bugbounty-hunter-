@@ -38,6 +38,7 @@ def test_database_models_persist_related_records() -> None:
         assert loaded_investigation.program.name == "Example Program"
         assert loaded_asset.investigation_id == loaded_investigation.id
         assert loaded_observation.asset_id == loaded_asset.id
+        assert loaded_observation.hypothesis_id is None
         assert loaded_asset.observations[0].data["record_type"] == "A"
 
     engine.dispose()
