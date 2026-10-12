@@ -90,7 +90,7 @@ def pin_url(
     url: str,
     *,
     authorize: URLAuthorizer,
-    resolver: Resolver = _system_resolver,
+    resolver: Resolver | None = None,
 ) -> PinnedTarget:
     """Authorize a URL and resolve it to public IPs for a pinned connection.
 
@@ -105,7 +105,8 @@ def pin_url(
         literal = ipaddress.ip_address(hostname)
     except ValueError:
         try:
-            resolved = resolver(hostname, port)
+            resolver_function = resolver if resolver is not None else _system_resolver
+            resolved = resolver_function(hostname, port)
             addresses = tuple(dict.fromkeys(ipaddress.ip_address(item) for item in resolved))
         except (OSError, ValueError) as error:
             raise TargetRejected("Hostname could not be safely resolved") from error

@@ -12,14 +12,15 @@ V1 provides program configuration, scope enforcement, safe DNS resolution, passi
 4. `workers.recon.passive_discover()` calls the authorized resolver before querying A, AAAA, MX, and TXT records through dnspython. Each record query consumes one `RateLimiter` allowance; when the allowance is exhausted, recon stops and returns observations already collected. It performs DNS lookups only.
 5. `workers.storage.store_observations()` creates or reuses an asset within an investigation and adds observations to the caller's SQLAlchemy session. The caller owns commit and rollback.
 6. `data.models` defines Program, Investigation, Asset, and Observation. `data.db.init_db()` creates the schema and returns an engine.
-7. `verification.http_probe.probe_endpoint()` authorizes and pins a URL, sends one GET directly to the selected pinned IP, and returns status, sanitized headers, elapsed time, and declared content length. It does not read the response body or follow redirects.
+7. `verification.http_probe.probe_endpoint()` authorizes and pins a URL, sends one GET directly to the selected pinned IP, and returns status, sanitized/truncated headers, elapsed time, actual body length, and a SHA-256 body hash. The raw body is not retained, and redirects are not followed.
 
 ## Security Boundaries
 
 - Scope checks are deny-by-default; only explicit exact or wildcard entries authorize hostnames.
 - Excluded patterns always win, including when a broader wildcard is authorized.
 - New hostname resolution should go through `gateway.resolver.authorized_resolve()`, not call `gateway.dns_pin` directly.
-- `verification.http_probe` connects to a `pin_url()`-validated address while preserving the hostname for the HTTP Host header and TLS server name. Any future HTTP client must preserve this invariant; resolving the URL again in the client would reintroduce DNS rebinding risk.
+- `verification.http_probe` uses a per-probe Requests adapter to connect to a `pin_url()`-validated address while preserving the hostname for the HTTP Host header and TLS server name. Any future HTTP client must preserve this invariant; resolving the URL again in the client would reintroduce DNS rebinding risk.
+- Probe evidence omits `Set-Cookie`, `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`; header values are truncated, and only the response body hash and byte count are returned.
 - Recon is passive DNS only. The HTTP probe is a single explicit request and does not follow redirects. No port scanning or autonomous actions are part of V1.
 - `programs/example_program.yaml` uses `.test`, a reserved testing domain; it is not a live target configuration.
 
