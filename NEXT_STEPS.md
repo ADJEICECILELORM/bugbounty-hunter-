@@ -4,7 +4,7 @@
 
 ## Status so far
 
-- ✅ `gateway/dns_pin.py` + tests — DNS pinning, SSRF protection, redirect validation. **Needs human review of actual file contents before building on top (pending).**
+- ✅ `gateway/dns_pin.py` + tests — DNS pinning, SSRF protection, redirect validation. **Human review of the actual file contents is done (see "DNS Pinning Review" below); no exploitable defect found, and 22 hardening cases were added.**
 - ✅ Tasks 1–8 — Scope Policy, Program Config Loader, Authorized Resolver, Rate Limiter, PostgreSQL Schema, Passive Recon, Storage, and End-to-End Smoke Test
 - ✅ Recon enforces the configured rate limit per DNS record query and preserves partial results when throttled.
 - ⚠️ Live recon against a program-authorized domain has not been run. The example uses the reserved `.test` domain and integration tests mock DNS.
@@ -55,7 +55,7 @@
 
 ## V1 complete when
 
-All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-authorized domain remains unverified; review `gateway/dns_pin.py` and replace the reserved `.test` example with verified scope before live use.
+All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-authorized domain remains unverified; `gateway/dns_pin.py` has been reviewed (see "DNS Pinning Review" below), so the remaining step is to replace the reserved `.test` example with verified scope before live use.
 
 ## Controlled Verification Progress
 
@@ -68,6 +68,24 @@ All 8 tasks and `test_v1_e2e.py` pass. A manual live run against a real program-
 - ✅ Lab transport API cleanup: `verification/lab_verification.py` now depends on the stable, guarded `verification.http_probe.probe_lab_target()` (plus the public `validate_timeout`). That API requires both `allow_private_network=True` and a lab-marked target, reuses the same pinned transport as `probe_endpoint()`, and cannot become a general private-IP bypass; the private `_probe_pinned_target`/`_validate_timeout` helpers are no longer imported by any lab caller. Isolation tests assert the lab transport is reachable only from `lab_verification.py` and that `probe_endpoint()` still rejects non-public targets.
 - ✅ Dormant Layer 8 client: `intelligence/llm_client.py` returns text suggestions only and has no investigation-flow callers; target-originated context is explicitly marked untrusted and bounded.
 - ⚠️ Broader or authenticated verification still requires an explicitly approved target and test accounts; this smoke run tested only a public read-only lab endpoint.
+
+## DNS Pinning Review (completed)
+
+Human review of the actual `gateway/dns_pin.py` contents (not just its passing tests), per the standing practice of distrusting green tests on security-sensitive modules. **Result: no exploitable defect found** — the SSRF/rebinding invariants hold. Verified properties:
+
+- **Fail-closed ordering.** `pin_url()` validates the URL, calls `authorize(normalized_url)`, and only then resolves. An out-of-scope URL is rejected before any DNS query, so scope cannot be probed via resolution side effects.
+- **Single parser, no differential.** The hostname derived once by `_parse_url()` is the same value used for authorization, resolution, the HTTP `Host` header, and the TLS server name. There is no second parser to disagree with, so authority-confusion tricks (`https://good.com\@evil.com/`, `user@host`, fragments such as `https://example.com#@evil.com/`) cannot redirect the request.
+- **Strict answer validation.** *Every* resolved address must be `is_global`; a single private answer rejects the whole target, rather than filtering it out (which would permit rebinding onto the surviving private answer). Verified to cover IPv4 loopback, IPv6 loopback, IPv4-mapped loopback (`::ffff:127.0.0.1`), scoped link-local (`fe80::1%eth0`), link-local/metadata (`169.254.169.254`), carrier-grade NAT (`100.64.0.1`), and `0.0.0.0`. Public IPv6 answers are accepted.
+- **No DNS-rebinding (TOCTOU) window.** The validated IP is carried in `PinnedTarget.addresses`; `verification/http_probe.py` connects to that literal IP (`create_connection((self._pinned_ip, self.port))`) with `max_retries=0`, and the URL is never re-resolved while `Host`/SNI stay bound to the hostname. The checked value and the used value are the same object.
+- **Redirects are re-authorized.** `validate_redirect()` re-runs the full authorize + resolve + validate path on `urljoin(current, location)`, and the probe disables redirects entirely (`allow_redirects=False`).
+- **Lab mode stays separate.** `pin_lab_url()` is the only path that skips the public-IP check; it still calls the authorizer, marks the target `is_lab_target=True`, requires `allow_private_network=True`, and is unreachable from public flows.
+
+Documented, non-exploitable observations:
+
+- The default port is not canonicalized in the `authorize()` input, so `https://example.com/` and `https://example.com:443/` are presented as different strings. This is fail-closed for exact-URL allowlists (the variant is rejected rather than widened) and is now locked in by `test_pin_url_does_not_canonicalize_the_default_port`.
+- Authorization ultimately trusts the *resolved* address being global, so a caller-supplied `resolver` that returns a public IP for a non-canonical host (e.g. the decimal form `2130706433`) is trusted. The default `_system_resolver` is safe because `getaddrinfo` returns the numeric interpretation, which then fails the `is_global` check. Do not pass a permissive resolver.
+
+`tests/test_dns_pin.py` grew 8 → 30 cases to pin the properties above so a future edit cannot silently weaken them.
 
 ## After V1
 
