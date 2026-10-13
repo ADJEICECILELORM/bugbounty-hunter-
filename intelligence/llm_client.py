@@ -1,4 +1,9 @@
-"""Dormant text-only API client for DeepSeek completions."""
+"""Text-only API client for DeepSeek completions.
+
+Returns text suggestions only: it never executes a tool, never writes a status,
+and never mutates caller state. Its single investigation-flow caller is
+:func:`intelligence.hypothesis_generation.generate_hypotheses`.
+"""
 
 from __future__ import annotations
 
