@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 venv/
 /lab_evidence.db*
+/lab_evidence_v3.db*
