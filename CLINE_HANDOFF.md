@@ -6,7 +6,7 @@ Use `ARCHITECTURE.md` for the current module/data flow and `NEXT_STEPS.md` for t
 
 - Branch: `main`
 - Last verified code commits: `050748e` (`Review gateway/dns_pin.py and pin its SSRF invariants with tests`) and `8aa96b4` (`Add manual lab-only basket-access experiment script`), preceded by `c7bb2b7` (`Extract guarded lab-only probe transport API`).
-- The worktree is clean; local `main` is 2 commits ahead of `origin/main` (not yet pushed).
+- The worktree is clean and `origin/main` matches the pushed history (see `93808c8`; this line was corrected after that handoff commit, so the tree is one commit ahead of it — pushed immediately after. `050748e` and `8aa96b4`).
 - Last full test run: 107 passed (+22 `dns_pin` hardening cases over the previous 85).
 
 ## Project Goal
