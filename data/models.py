@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, JSON, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -84,6 +84,12 @@ class Hypothesis(Base):
     observations: Mapped[list[Observation]] = relationship(
         back_populates="hypothesis", cascade="all, delete-orphan"
     )
+    verdicts: Mapped[list[Verdict]] = relationship(
+        back_populates="hypothesis", cascade="all, delete-orphan"
+    )
+    finding: Mapped[Finding | None] = relationship(
+        back_populates="hypothesis", cascade="all, delete-orphan", uselist=False
+    )
 
 
 class Observation(Base):
@@ -102,3 +108,80 @@ class Observation(Base):
 
     asset: Mapped[Asset] = relationship(back_populates="observations")
     hypothesis: Mapped[Hypothesis | None] = relationship(back_populates="observations")
+
+
+class Verdict(Base):
+    """A deterministic judgement of one observation, never of a hypothesis.
+
+    A verdict records what stored evidence does or does not show. It is written
+    by the offline checker and carries no authority of its own: only
+    ``promote_to_finding`` may turn supporting verdicts into a finding, and it
+    requires an explicit human approver.
+
+    ``integrity_digest`` binds the stored judgement to the evidence row it
+    judged, the hypothesis, and the target URLs, plus the canonical digest of
+    the stored evidence. :mod:`verification.verdict_integrity` recomputes it, and
+    every consumer of a verdict verifies it before use, so an edited or
+    hand-written row is rejected rather than trusted.
+    """
+
+    __tablename__ = "verdicts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("hypotheses.id"), nullable=False
+    )
+    observation_id: Mapped[int] = mapped_column(
+        ForeignKey("observations.id"), nullable=False
+    )
+    claim_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_control: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
+    rationale: Mapped[str] = mapped_column(String(1000), nullable=False)
+    integrity_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    hypothesis: Mapped[Hypothesis] = relationship(back_populates="verdicts")
+    observation: Mapped[Observation] = relationship()
+
+
+class Finding(Base):
+    """The only record that claims a human verified a hypothesis."""
+
+    __tablename__ = "findings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("hypotheses.id"), nullable=False, unique=True
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    hypothesis: Mapped[Hypothesis] = relationship(back_populates="finding")
+
+
+class PromotionAudit(Base):
+    """Append-only record of who promoted what, when, and from which evidence."""
+
+    __tablename__ = "promotion_audit"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("hypotheses.id"), nullable=False
+    )
+    finding_id: Mapped[int | None] = mapped_column(
+        ForeignKey("findings.id"), nullable=True
+    )
+    evidence_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False)
+    verdict_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
