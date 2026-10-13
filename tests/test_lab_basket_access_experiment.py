@@ -92,14 +92,19 @@ def test_parse_product_ids_returns_empty_for_an_empty_basket() -> None:
     assert parse_product_ids({"data": {"Products": []}}) == frozenset()
 
 
-def test_parse_product_ids_ignores_entries_without_a_plain_integer_id() -> None:
-    payload = {"data": {"Products": [{"id": "1"}, {"name": "x"}, {"id": True}, "nope"]}}
-    assert parse_product_ids(payload) == frozenset()
-
-
 @pytest.mark.parametrize(
     "payload",
-    [{"data": {"Products": "not-a-list"}}, {"data": 7}, None, "text"],
+    [
+        {"data": {}},
+        {"data": {"Products": "not-a-list"}},
+        {"data": {"Products": [{"id": "1"}]}},
+        {"data": {"Products": [{"name": "missing id"}]}},
+        {"data": {"Products": [{"id": True}]}},
+        {"data": {"Products": ["not a product object"]}},
+        {"data": 7},
+        None,
+        "text",
+    ],
 )
 def test_parse_product_ids_refuses_unreadable_payloads(payload: object) -> None:
     with pytest.raises(RuntimeError):

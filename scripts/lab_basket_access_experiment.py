@@ -88,7 +88,9 @@ def parse_product_ids(payload: Any) -> frozenset[int]:
     """
     body: Any = payload.get("data", payload) if isinstance(payload, dict) else payload
     if isinstance(body, dict):
-        products: Any = body.get("Products", [])
+        if "Products" not in body:
+            raise RuntimeError("basket response omitted its Products list")
+        products: Any = body["Products"]
     elif isinstance(body, list):
         products = body
     else:
@@ -99,10 +101,11 @@ def parse_product_ids(payload: Any) -> frozenset[int]:
     ids: set[int] = set()
     for product in products:
         if not isinstance(product, dict):
-            continue
+            raise RuntimeError("unexpected product entry in basket response")
         product_id = product.get("id")
-        if isinstance(product_id, int) and not isinstance(product_id, bool):
-            ids.add(product_id)
+        if isinstance(product_id, bool) or not isinstance(product_id, int):
+            raise RuntimeError("basket product omitted a valid integer id")
+        ids.add(product_id)
     return frozenset(ids)
 
 
