@@ -3,6 +3,8 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from data.models import Hypothesis
 from intelligence import prioritization
 from intelligence.prioritization import prioritize_hypotheses
@@ -124,6 +126,44 @@ def test_category_matching_ignores_case_and_surrounding_space() -> None:
     ]
 
     assert [item.id for item in prioritize_hypotheses(hypotheses)] == [2, 1]
+
+
+@pytest.mark.parametrize(
+    "raw_category",
+    [
+        "access-control",
+        "Access-Control",
+        "access control",
+        "  ACCESS_CONTROL  ",
+        "access.control",
+    ],
+)
+def test_prioritized_category_matching_survives_punctuation_and_case(
+    raw_category: str,
+) -> None:
+    """A stored row counts as access-control however its category was spelled.
+
+    The parser canonicalizes model output, but a row can also arrive from a
+    fixture, an operator, or a future importer. Any spelling that normalizes to
+    ``access_control`` must reach the same tier, or it would be mis-ranked.
+    """
+    hypotheses = [
+        _hypothesis(1, "injection", created_at=_at(1)),
+        _hypothesis(2, raw_category, created_at=_at(0)),
+    ]
+
+    assert [item.id for item in prioritize_hypotheses(hypotheses)] == [2, 1]
+
+
+def test_normalized_matching_never_prioritizes_a_different_category() -> None:
+    """Widening normalization must not drag unrelated categories into the tier."""
+    hypotheses = [
+        _hypothesis(1, "injection", created_at=_at(1)),
+        _hypothesis(2, "access_control_weakness", created_at=_at(0)),
+        _hypothesis(3, "IDOR", created_at=_at(0)),
+    ]
+
+    assert [item.id for item in prioritize_hypotheses(hypotheses)] == [3, 1, 2]
 
 
 def test_the_module_stays_deterministic_and_model_free() -> None:

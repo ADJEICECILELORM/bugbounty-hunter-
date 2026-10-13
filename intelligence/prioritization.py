@@ -4,6 +4,8 @@ There is no model call, no confidence weighting, and no hidden score. The whole
 rule fits in one sentence: **unverified hypotheses are ordered by category weight
 (access-control and IDOR first, then everything else), then newest first, then by
 row id, category, and description so the result never depends on input order.**
+Category matching goes through :mod:`intelligence.categories`, so ``access-control``
+and ``Access Control`` in a stored row are ranked exactly like ``access_control``.
 
 Deliberately simpler than the design document's confidence-weighted "Task
 Priority" formula: that formula has no validation behind it, and a ranking a human
@@ -20,20 +22,24 @@ from __future__ import annotations
 from datetime import UTC
 
 from data.models import Hypothesis
+from intelligence.categories import PRIORITIZED_CATEGORIES, is_prioritized
 
 UNVERIFIED = "unverified"
-
-# Categories whose whole point is an ownership or authorization boundary - the
-# class of check this project can currently produce differential evidence for.
-_PRIORITIZED_CATEGORIES = frozenset({"access_control", "idor"})
 
 _PRIORITIZED_WEIGHT = 0
 _GENERIC_WEIGHT = 1
 
 
 def _category_weight(category: str | None) -> int:
-    normalized = (category or "").strip().lower()
-    if normalized in _PRIORITIZED_CATEGORIES:
+    """Weight by category using the shared normalization, never a local copy.
+
+    The weight lookup deliberately shares
+    :func:`intelligence.categories.normalize_category` with the parser instead of
+    re-deriving a canonical form here: a row written by any path other than the
+    parser (a fixture, an operator, a future importer) must still be ranked by
+    the same rule, or it would silently miss the tier below.
+    """
+    if is_prioritized(category):
         return _PRIORITIZED_WEIGHT
     return _GENERIC_WEIGHT
 

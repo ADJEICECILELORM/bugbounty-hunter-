@@ -294,3 +294,21 @@ def test_parser_ignores_reserved_metadata_and_lines_without_a_colon() -> None:
     assert parse_hypothesis_lines("ACCESS CONTROL: check the basket") == [
         ("access_control", "check the basket")
     ]
+
+
+def test_parser_canonicalizes_punctuation_so_categories_cannot_drift() -> None:
+    """Whatever the model's spelling, the stored category is canonical.
+
+    The ranker weights a stored category by name, so a parser that passed
+    ``Information Disclosure`` or ``access-control`` through unchanged would
+    produce a row that silently misses the access-control tier.
+    """
+    assert parse_hypothesis_lines("Information Disclosure: check the basket id\n") == [
+        ("information_disclosure", "check the basket id")
+    ]
+    assert parse_hypothesis_lines("access-control: compare two accounts\n") == [
+        ("access_control", "compare two accounts")
+    ]
+    assert parse_hypothesis_lines("  IDOR / basket: enumerate ids\n") == [
+        ("idor_basket", "enumerate ids")
+    ]

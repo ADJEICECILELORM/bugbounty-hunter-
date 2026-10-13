@@ -23,13 +23,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from data.models import Asset, Hypothesis, Observation
+from intelligence.categories import normalize_category
 from intelligence.llm_client import generate_completion
 from intelligence.observation_summary import summarize_observations
 
 UNVERIFIED = "unverified"
 
 MAX_HYPOTHESES = 3
-_MAX_CATEGORY_LENGTH = 64
 _MAX_DESCRIPTION_LENGTH = 1000
 
 SYSTEM_PROMPT = (
@@ -60,18 +60,11 @@ _RESERVED_CATEGORIES = frozenset(
 )
 
 _LIST_MARKER = re.compile(r"^(?:[-*\u2022]|\d+[.)])\s+")
-_NON_CATEGORY_CHARS = re.compile(r"[^a-z0-9]+")
 _WHITESPACE = re.compile(r"\s+")
 
 
 def _clean_text(text: str) -> str:
     return _WHITESPACE.sub(" ", text).strip()
-
-
-def _normalize_category(raw: str) -> str:
-    return _NON_CATEGORY_CHARS.sub("_", raw.strip().lower()).strip("_")[
-        :_MAX_CATEGORY_LENGTH
-    ]
 
 
 def _clean_description(raw: str) -> str:
@@ -99,7 +92,7 @@ def parse_hypothesis_lines(response_text: str) -> list[tuple[str, str]]:
         if not line or ":" not in line:
             continue
         raw_category, _, raw_description = line.partition(":")
-        category = _normalize_category(raw_category)
+        category = normalize_category(raw_category)
         if not category or category in _RESERVED_CATEGORIES:
             continue
         description = _clean_description(raw_description)
