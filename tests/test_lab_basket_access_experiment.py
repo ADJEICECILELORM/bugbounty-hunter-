@@ -13,6 +13,7 @@ from data.db import init_db
 from data.models import Asset, Hypothesis, Investigation, Program
 from scripts import lab_basket_access_experiment as experiment
 from scripts.lab_basket_access_experiment import (
+    LAB_START_COMMAND,
     PRODUCT_ID,
     BasketRead,
     exact_url_authorizer,
@@ -274,3 +275,33 @@ def test_main_creates_no_evidence_when_a_basket_read_fails(
         experiment.main()
 
     assert events == []
+
+
+def test_main_exits_with_the_exact_start_command_when_the_lab_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-closed path must tell the operator how to start the lab."""
+
+    class _DownRequests:
+        RequestException = RuntimeError
+
+        @staticmethod
+        def get(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(experiment, "requests", _DownRequests)
+
+    with pytest.raises(SystemExit) as excinfo:
+        experiment.main()
+
+    message = str(excinfo.value)
+    assert "unreachable" in message
+    assert LAB_START_COMMAND in message
+
+
+def test_lab_start_command_keeps_the_target_on_loopback() -> None:
+    """The documented command must not expose the vulnerable lab to a network."""
+    assert "bkimminich/juice-shop" in LAB_START_COMMAND
+    assert "-p 127.0.0.1:3000:3000" in LAB_START_COMMAND
+    assert "0.0.0.0" not in LAB_START_COMMAND
+

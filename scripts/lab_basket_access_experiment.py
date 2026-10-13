@@ -27,7 +27,11 @@ only its pure fail-closed gates are unit-tested
 (``tests/test_lab_basket_access_experiment.py``).
 
 Usage:
+    docker run --rm -d --name juice-shop -p 127.0.0.1:3000:3000 bkimminich/juice-shop
     venv/bin/python scripts/lab_basket_access_experiment.py
+
+If the lab target is down, the script exits with the command above instead of
+attempting any request.
 """
 
 from __future__ import annotations
@@ -56,6 +60,17 @@ BASE_URL = "http://127.0.0.1:3000"
 LAB_DB_URL = f"sqlite+pysqlite:///{REPO_ROOT / 'lab_evidence.db'}"
 PRODUCT_ID = 1
 HTTP_TIMEOUT = 10.0
+
+# The upstream command is
+# ``docker run -d -p 127.0.0.1:3000:3000 bkimminich/juice-shop``
+# (pwning.owasp-juice.shop, "Docker image"). ``--rm --name juice-shop`` are
+# additive: a disposable, easy-to-stop lab container. The port binding stays
+# loopback-only, matching the hard-coded BASE_URL above; the lab target must
+# never be reachable from another host.
+LAB_START_COMMAND = (
+    "docker run --rm -d --name juice-shop "
+    "-p 127.0.0.1:3000:3000 bkimminich/juice-shop"
+)
 
 
 @dataclass(frozen=True)
@@ -300,8 +315,11 @@ def main() -> int:
         requests.get(f"{BASE_URL}/", timeout=HTTP_TIMEOUT)
     except requests.RequestException as error:
         raise SystemExit(
-            f"Lab target {BASE_URL} is unreachable ({type(error).__name__}). "
-            "Start the local Juice Shop instance first."
+            f"Lab target {BASE_URL} is unreachable ({type(error).__name__}).\n"
+            "Start the local lab first (prefix with sudo if your user cannot "
+            "reach the Docker socket):\n"
+            f"  {LAB_START_COMMAND}\n"
+            "Then re-run this script."
         ) from error
 
     suffix = secrets.token_hex(4)
