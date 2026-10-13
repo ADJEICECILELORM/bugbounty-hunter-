@@ -5,9 +5,9 @@ Use `ARCHITECTURE.md` for the current module/data flow and `NEXT_STEPS.md` for t
 ## Current Checkpoint
 
 - Branch: `main`
-- Last verified code commit: `c7bb2b7` (`Extract guarded lab-only probe transport API`), followed by the bytecode-cache hygiene commit `716d2cc` and this handoff update.
-- The worktree is clean and `origin/main` matches the pushed history.
-- Last full test run: 85 passed after the lab transport API cleanup (+5 tests over the previous 80).
+- Last verified code commits: `050748e` (`Review gateway/dns_pin.py and pin its SSRF invariants with tests`) and `8aa96b4` (`Add manual lab-only basket-access experiment script`), preceded by `c7bb2b7` (`Extract guarded lab-only probe transport API`).
+- The worktree is clean; local `main` is 2 commits ahead of `origin/main` (not yet pushed).
+- Last full test run: 107 passed (+22 `dns_pin` hardening cases over the previous 85).
 
 ## Project Goal
 
@@ -23,6 +23,7 @@ Build Project 001 as a persistent, policy-governed bug bounty research system, i
 - `gateway/lab_mode.py` is an explicit private-network pinning escape hatch. It requires `allow_private_network=True`, still invokes the authorizer, returns `LabPinnedTarget(is_lab_target=True)`, and is not imported by normal workers or public verification paths.
 - `verification/lab_verification.py` is the separate manual lab flow; it probes through the guarded `verification/http_probe.probe_lab_target()` lab transport (see below).
 - `intelligence/llm_client.py` is dormant, API-only DeepSeek infrastructure. It reads `DEEPSEEK_API_KEY` from the environment, bounds and marks untrusted target text, returns text only, and has no investigation-flow callers. Do not wire it into a live flow yet.
+- `scripts/lab_basket_access_experiment.py` is a manual, lab-only operator script (not part of the package or the test suite). It registers two disposable local Juice Shop accounts, seeds one basket, and exercises the guarded lab transport end to end via two `run_lab_verification()` calls, writing evidence only to the separate `lab_evidence.db`. Credentials and JWTs stay in memory; the hypothesis status is never changed.
 
 ## Live Lab Check
 
@@ -36,12 +37,18 @@ That live run found and fixed an urllib3 API mismatch: call `response.raw.stream
 
 Resolved in `c7bb2b7`. `verification/lab_verification.py` no longer imports the private `_probe_pinned_target` / `_validate_timeout` helpers. It now uses the stable, guarded `verification.http_probe.probe_lab_target()` (plus the public `validate_timeout`). That transport requires both `allow_private_network=True` and a target marked `is_lab_target=True` (a new `PinnedTarget` field that defaults to `False`, so public targets can never satisfy it), then delegates to the same private pinned transport used by `probe_endpoint()`. It therefore cannot become a general private-IP request path, and `probe_endpoint()` / `run_verification()` remain public-only. Isolation tests assert the lab transport is reachable only from `lab_verification.py` and that `probe_endpoint()` still rejects non-public targets.
 
+## DNS Pinning Review (completed)
+
+Audited the actual `gateway/dns_pin.py` contents (not merely its tests) in `050748e`. **No exploitable defect found**; the SSRF/rebinding invariants hold: `authorize()` runs before any resolution, one `urlsplit`-derived hostname is shared by authorization/resolution/Host/SNI (so no parser differential), *every* resolved answer must be `is_global`, and the validated literal IP is pinned with `max_retries=0` and never re-resolved (no TOCTOU window). Two non-exploitable observations are documented: the default port is not canonicalized in the `authorize()` input (fail-closed for exact-URL allowlists), and a caller-supplied permissive `resolver` would be trusted. `tests/test_dns_pin.py` grew 8 → 30 cases to pin these properties. Full write-up is in `NEXT_STEPS.md` ("DNS Pinning Review").
+
 ## Next Work
 
 1. ✅ Resolved in `c7bb2b7` (guarded `probe_lab_target()` lab transport). Normal-path, lab-path, and full-suite tests all pass.
-2. If the user explicitly chooses to proceed, create two local Juice Shop test accounts and keep credentials only in memory/environment. Do not log or persist tokens. Use a specific user-approved endpoint/hypothesis; do not assume an IDOR exists or probe unrelated targets.
-3. Run one comparison with distinct account headers through the lab-only flow, inspect sanitized diff evidence, and leave the hypothesis status unchanged for human review.
-4. Only after the user approves, consider the separate hypothesis-generation module. The LLM remains dormant; target-originated text stays untrusted and must never trigger tools or writes directly.
+2. ✅ Resolved in `050748e` (audited `gateway/dns_pin.py`, added 22 hardening tests, recorded the review).
+3. **Held at the user's request — prepared but not run.** `scripts/lab_basket_access_experiment.py` is ready and locally validated (compiles; the exact-URL authorizer rejects every non-allowlisted URL; missing `allow_private_network=True` is rejected). The run waits on the local lab being started: `http://127.0.0.1:3000` was unreachable and Docker requires an interactive `sudo` password.
+4. When the user chooses to proceed: create two disposable local Juice Shop accounts and keep credentials only in memory/environment. Do not log or persist tokens. Use a specific user-approved endpoint/hypothesis; do not assume an IDOR exists or probe unrelated targets.
+5. Run one comparison with distinct account headers through the lab-only flow, inspect sanitized diff evidence, and leave the hypothesis status unchanged for human review. If A and B receive identical bytes for A's populated basket while B's own empty basket differs, that is reproducible evidence of cross-account access **in the local lab only** — not an automatic status promotion and not a claim about any real program.
+6. Only after the user approves, consider the separate hypothesis-generation module. The LLM remains dormant; target-originated text stays untrusted and must never trigger tools or writes directly.
 
 ## Safety and Workflow Rules
 
