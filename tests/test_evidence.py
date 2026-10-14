@@ -1,12 +1,18 @@
 import ipaddress
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from data.db import init_db
 from data.models import Asset, Hypothesis, Investigation, Observation, Program
-from verification.diff_check import DiffResult
-from verification.evidence import store_diff_evidence
+from verification.diff_check import DiffResult, build_diff_result
+from verification.evidence import (
+    INVENTORY_OBSERVATION_TYPE,
+    diff_data,
+    store_diff_evidence,
+    store_inventory_evidence,
+)
 from verification.http_probe import ProbeResult
 
 
@@ -122,5 +128,76 @@ def test_observation_without_hypothesis_remains_supported() -> None:
         assert loaded_observation is not None
         assert loaded_observation.hypothesis_id is None
         assert loaded_observation.hypothesis is None
+
+    engine.dispose()
+
+
+def test_store_inventory_evidence_links_the_asset_and_allowlists_the_probe() -> None:
+    engine = init_db("sqlite+pysqlite:///:memory:")
+    probe = ProbeResult(
+        url="http://127.0.0.1:3000/robots.txt",
+        status_code=200,
+        headers={"content-type": "text/plain"},
+        response_time_ms=2.5,
+        content_length=42,
+        body_sha256="c" * 64,
+    )
+
+    with Session(engine) as session:
+        program = Program(
+            name="Local lab",
+            authorized_scope=["127.0.0.1"],
+            excluded_scope=[],
+            rate_limit=30,
+        )
+        investigation = Investigation(program=program, status="running")
+        asset = Asset(investigation=investigation, hostname="127.0.0.1")
+        session.add(asset)
+        session.flush()
+
+        observation = store_inventory_evidence(asset.id, probe, session)
+        loaded_observation = session.scalar(select(Observation))
+        reference = build_diff_result(probe.url, probe.url, probe, probe)
+
+        assert loaded_observation is not None
+        assert loaded_observation is observation
+        assert loaded_observation.observation_type == INVENTORY_OBSERVATION_TYPE
+        assert loaded_observation.asset_id == asset.id
+        assert loaded_observation.hypothesis_id is None
+        assert loaded_observation.hypothesis is None
+        assert loaded_observation in asset.observations
+        # The stored mapping is exactly what a comparison stores for one probe,
+        # so an inventory row reuses the audited allowlist instead of a new one.
+        assert loaded_observation.data == diff_data(reference)["probe_a"]
+        assert set(loaded_observation.data) == {
+            "url",
+            "status_code",
+            "headers",
+            "response_time_ms",
+            "content_length",
+            "body_sha256",
+        }
+        assert loaded_observation.data["body_sha256"] == "c" * 64
+        assert session.in_transaction()
+
+    engine.dispose()
+
+
+def test_store_inventory_evidence_requires_an_existing_asset() -> None:
+    engine = init_db("sqlite+pysqlite:///:memory:")
+    probe = ProbeResult(
+        url="http://127.0.0.1:3000/robots.txt",
+        status_code=200,
+        headers={},
+        response_time_ms=1.0,
+        content_length=0,
+        body_sha256="d" * 64,
+    )
+
+    with Session(engine) as session:
+        with pytest.raises(LookupError, match="Asset 4242 does not exist"):
+            store_inventory_evidence(4242, probe, session)
+
+        assert session.scalars(select(Observation)).all() == []
 
     engine.dispose()

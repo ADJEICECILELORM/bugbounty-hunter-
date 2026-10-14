@@ -6,11 +6,16 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from data.models import Hypothesis, Observation, Verdict
+from data.models import Asset, Hypothesis, Observation, Verdict
 from verification.diff_check import DiffResult
 from verification.http_probe import ProbeResult
 from verification.verdict_checker import VerdictResult
 from verification.verdict_integrity import digest_for, verify_verdict
+
+# Asset-level observation context, never a judgement input: no verdict rule reads
+# these rows, and ``verify_verdict()`` accepts ``diff_check`` evidence only, so a
+# row stored with this type cannot be cited as a verdict's evidence.
+INVENTORY_OBSERVATION_TYPE = "endpoint_inventory"
 
 
 def _probe_evidence(probe: ProbeResult) -> dict[str, object]:
@@ -61,6 +66,45 @@ def store_diff_evidence(
         hypothesis_id=hypothesis.id,
         observation_type="diff_check",
         data=diff_data(diff_result),
+    )
+    session.add(observation)
+    session.flush()
+    return observation
+
+
+def inventory_data(probe: ProbeResult) -> dict[str, object]:
+    """The allowlisted evidence mapping for one inventory probe.
+
+    Deliberately the same mapping a comparison records for one probe: an
+    integrity digest binds whatever is stored here for as long as the row exists,
+    so this reuses the audited allowlist instead of inventing a second field set
+    that older readers would not know, and no collector can add a field to it.
+    """
+    return _probe_evidence(probe)
+
+
+def store_inventory_evidence(
+    asset_id: int,
+    probe: ProbeResult,
+    session: Session,
+) -> Observation:
+    """Store one authorized inventory probe as asset-level context.
+
+    The row carries no ``hypothesis_id``: an inventory is not evidence for any
+    claim, so nothing here judges it, promotes it, or binds it to a hypothesis.
+    ``verification.verdict_integrity.verify_verdict()`` accepts ``diff_check``
+    evidence only, which is what keeps that true even if a caller later tries to
+    cite the row. Flush only, never commit - the caller owns the transaction.
+    """
+    asset = session.get(Asset, asset_id)
+    if asset is None:
+        raise LookupError(f"Asset {asset_id} does not exist")
+
+    observation = Observation(
+        asset_id=asset.id,
+        hypothesis_id=None,
+        observation_type=INVENTORY_OBSERVATION_TYPE,
+        data=inventory_data(probe),
     )
     session.add(observation)
     session.flush()

@@ -24,6 +24,16 @@ Every stored verdict carries an integrity digest binding its semantic content to
 
 No state implies the next: a `supported` verdict is not a finding, a `Finding` is not a report, and nothing in V3 schedules, submits, or auto-promotes.
 
+### Inventory observations are context, never verdict evidence
+
+`verification.endpoint_inventory_collector.collect_seed_inventory()` can store an `endpoint_inventory` observation: one authorized response from the fixed seed list that `verification.endpoint_inventory` builds. It reuses the allowlisted probe mapping a comparison records, so it *is* digest-bindable — and that is exactly why the boundary is stated rather than assumed: being digest-bindable is not the same as being judgement evidence. Three independent gates keep it out of verdicts:
+
+* `verification.verdict_integrity.verify_verdict()` accepts the `diff_check` observation type only and returns `evidence_type_mismatch` for anything else.
+* `verification.evidence.store_verdict()` refuses to write a verdict row that fails that same check, so the refusal happens before anything is stored.
+* `verification.finding_promotion.promote_to_finding()` refuses a verdict whose evidence is not a `diff_check`, so even a hand-written supported row over an inventory observation cannot produce a `Finding`.
+
+Only `CROSS_ACCOUNT_SAME_BYTES` verdicts are re-derivable at all (`_RE_DERIVABLE_CLAIM_TYPES`), and `verdict_integrity.target_urls()` reads `probe_a`/`probe_b`, which an inventory row does not carry, so one binds no target a verdict could cite. Inventory rows are therefore asset-level context: they feed `intelligence.observation_summary` — entirely as untrusted text, like any observation type the summarizer does not recognize (`_UNTRUSTED_OBSERVATION_TYPES`) — and, through it, hypothesis generation. Turning an inventory probe into evidence would need a new claim type and a new digest shape, which is a deliberate schema change rather than something a collector can cause.
+
 ## Data Flow
 
 1. `gateway.program_config.load_program()` loads and validates YAML program metadata and scope patterns.
@@ -66,6 +76,7 @@ No state implies the next: a `supported` verdict is not a finding, a `Finding` i
 - `verification.finding_promotion.promote_to_finding()` is the project's only writer of `Hypothesis.status` and its only creator of `Finding` rows; `tests/test_finding_promotion.py` asserts both properties across `verification/`, `intelligence/`, `gateway/`, and `data/`. Promotion requires a named human approver, refuses any refuted verdict, refuses any verdict that fails its integrity check, and records who, when, and what in `promotion_audit`.
 - `verification.finding_report.collect_finding_context()` verifies every verdict against its evidence, hypothesis, and target before a report can be rendered, so an edited row cannot be presented as approved evidence. The renderer itself writes nothing: it renders only allowlisted, already-stored values, does not re-probe, call a model, read the clock, or dump raw observation JSON, and it carries a local-lab banner plus explicit "local lab only / not a severity assessment / machine-checked, not human-confirmed" limitations.
 - `verification.finding_report` renders only allowlisted, already-stored values: it does not re-probe, re-judge, call a model, read the clock, or dump raw observation JSON. Reports carry a local-lab banner and explicit "local lab only / not a severity assessment / machine-checked, not human-confirmed" limitations.
+- `verification.endpoint_inventory_collector.collect_seed_inventory()` sends at most one guarded request per authorized seed candidate, commits nothing, passes no request headers, and reuses the guarded transports (`probe_endpoint()` publicly; with an explicit lab opt-in, `pin_lab_url()` then `probe_lab_target()`, with the whole candidate list pinned before the first probe). Its stored `endpoint_inventory` rows are asset-level context that no verdict may cite - see "Inventory observations are context, never verdict evidence".
 - Recon is passive DNS only. The HTTP probe is a single explicit request and does not follow redirects. No port scanning or autonomous actions are part of V1.
 - `programs/example_program.yaml` uses `.test`, a reserved testing domain; it is not a live target configuration.
 

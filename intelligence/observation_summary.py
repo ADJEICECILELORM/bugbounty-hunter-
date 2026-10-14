@@ -27,6 +27,9 @@ Untrusted handling rules, in full:
   by position in the generated source label. Nothing is dropped - entries of an
   unrecognized observation type simply arrive as untrusted items rather than as
   trusted scalar lines - so the rule stays conservative as new types are added.
+* A type listed in :data:`_UNTRUSTED_OBSERVATION_TYPES` is rendered entirely as
+  untrusted text whatever its field names are: its evidence can never bind a
+  verdict, so no part of it needs a trusted scalar line.
 * Source labels are therefore assembled only from this module's fixed vocabulary
   plus numeric positions, so target-controlled text can never reach a label.
 """
@@ -76,6 +79,13 @@ _KNOWN_FIELDS = frozenset(
     }
 )
 
+# Observation types whose entire rendering stays out of the trusted text. These
+# are context this module passes along and nothing may judge, so none of their
+# fields needs a trusted line - and the rule is on the type rather than on the
+# field names, so a future collector cannot make a target-derived candidate URL
+# trusted just by giving it a name this module already knows.
+_UNTRUSTED_OBSERVATION_TYPES = frozenset({"endpoint_inventory"})
+
 _ABSENT = "(absent)"
 
 
@@ -116,15 +126,21 @@ def _walk(
     observation_id: int | None,
     lines: list[str],
     untrusted: list[UntrustedText],
+    trusted: bool = True,
 ) -> None:
-    """Split one data value into trusted scalar lines and untrusted text items."""
+    """Split one data value into trusted scalar lines and untrusted text items.
+
+    ``trusted=False`` is used for the observation types in
+    :data:`_UNTRUSTED_OBSERVATION_TYPES`: every key and value is then treated as
+    external text, exactly as an unrecognized field of an unrecognized type is.
+    """
     joined = "_".join(path) if path else "data"
 
     if isinstance(value, Mapping):
         lines.append(f"{joined}_entries={len(value)}")
         for index, field in enumerate(sorted(value, key=str)):
             name = str(field)
-            if name in _KNOWN_FIELDS:
+            if trusted and name in _KNOWN_FIELDS:
                 _walk(
                     value=value[field],
                     path=path + (name,),
@@ -156,7 +172,7 @@ def _walk(
         return
 
     if isinstance(value, str):
-        if path and path[-1] not in _TRUSTED_STRING_FIELDS:
+        if not trusted or (path and path[-1] not in _TRUSTED_STRING_FIELDS):
             untrusted.append(
                 UntrustedText(
                     source=f"observation_{observation_id}_{joined}",
@@ -191,6 +207,7 @@ def _summarize_observation(
             observation_id=observation.id,
             lines=detail,
             untrusted=untrusted,
+            trusted=observation.observation_type not in _UNTRUSTED_OBSERVATION_TYPES,
         )
     else:
         # Not a mapping: keep the whole rendering out of the trusted text.

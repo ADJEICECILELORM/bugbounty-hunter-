@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from data.db import init_db
@@ -382,6 +383,52 @@ def test_non_comparison_evidence_is_rejected(session: Session) -> None:
 
     check = verify_verdict(verdict, observation, hypothesis_id=hypothesis.id)
     assert check.reason == EVIDENCE_TYPE_MISMATCH
+
+
+def test_inventory_evidence_is_digest_bindable_but_cannot_bind_a_verdict(
+    session: Session,
+) -> None:
+    """An endpoint_inventory row can be digested; it can never be judged."""
+    hypothesis = seed_hypothesis(session)
+    observation = Observation(
+        asset_id=hypothesis.asset_id,
+        hypothesis_id=hypothesis.id,
+        observation_type="endpoint_inventory",
+        data={
+            "url": BASKET_A,
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "response_time_ms": 3.0,
+            "content_length": 747,
+            "body_sha256": SHA_MATCH_A,
+        },
+    )
+    session.add(observation)
+    session.flush()
+
+    # It is a mapping of stored bytes, so the digest machinery can bind it ...
+    assert _SHA256.match(evidence_digest(observation) or "") is not None
+    # ... but it records no probe pair, so it binds no target a verdict could cite.
+    assert target_urls(observation) == ("", "")
+
+    verdict = Verdict(
+        hypothesis_id=hypothesis.id,
+        observation_id=observation.id,
+        claim_type=CROSS_ACCOUNT_SAME_BYTES,
+        is_control=False,
+        verdict="supported",
+        rationale="hand-written row over inventory context",
+        integrity_digest="0" * 64,
+    )
+
+    check = verify_verdict(verdict, observation, hypothesis_id=hypothesis.id)
+    assert check.reason == EVIDENCE_TYPE_MISMATCH
+
+    # And the writer refuses it before anything is stored.
+    result = check_verdict(observation.data, CLAIM)
+    with pytest.raises(RuntimeError, match="integrity check"):
+        store_verdict(hypothesis.id, observation, result, session)
+    assert session.scalars(select(Verdict)).all() == []
 
 
 def test_a_claim_type_the_checker_cannot_judge_is_bound_by_its_digest_only(

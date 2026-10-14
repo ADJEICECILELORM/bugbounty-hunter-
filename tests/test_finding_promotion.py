@@ -338,6 +338,38 @@ def test_promotion_is_refused_for_evidence_that_is_not_a_diff_check(
     assert "not a diff_check" in str(error.value)
 
 
+def test_promotion_is_refused_for_inventory_context_evidence(session: Session) -> None:
+    """Inventory rows are summarizer context: nothing built on them is promotable."""
+    hypothesis = seed_hypothesis(session)
+    seed_supported_evidence(session, hypothesis)
+    inventory_evidence = Observation(
+        asset_id=hypothesis.asset_id,
+        hypothesis_id=hypothesis.id,
+        observation_type="endpoint_inventory",
+        data={"url": BASKET_A, "status_code": 200, "content_length": 747},
+    )
+    session.add(inventory_evidence)
+    session.flush()
+    session.add(
+        Verdict(
+            hypothesis_id=hypothesis.id,
+            observation_id=inventory_evidence.id,
+            claim_type=CROSS_ACCOUNT_SAME_BYTES,
+            is_control=False,
+            verdict=SUPPORTED,
+            rationale="hand-written row over inventory context",
+            integrity_digest="0" * 64,
+        )
+    )
+    session.flush()
+
+    with pytest.raises(PromotionRefused) as error:
+        promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
+
+    assert "not a diff_check" in str(error.value)
+    assert session.scalars(select(Finding)).all() == []
+
+
 def test_promotion_is_refused_when_a_supporting_verdict_was_edited(
     session: Session,
 ) -> None:
