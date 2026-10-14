@@ -4,3 +4,4 @@ __pycache__/
 venv/
 /lab_evidence.db*
 /lab_evidence_v3.db*
+/finding-*.md
