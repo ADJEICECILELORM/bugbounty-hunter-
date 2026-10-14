@@ -30,6 +30,13 @@
 - ✅ The existing `lab_evidence.db` opens unchanged with the three new tables (`verdicts`, `findings`, `promotion_audit`); no existing table or column was altered, so the Part 1 evidence stays valid. Verified on a `/tmp` copy. V3 was developed without touching the live DB: the schema check runs against a copy, and the live file's mtime and size are unchanged.
 - Full suite at this milestone: `287 passed` (172 before V3; 115 new cases; the verdict-integrity binding added 36 of them).
 
+## Endpoint inventory — first slice (status)
+
+- ✅ `verification/endpoint_inventory.py` — the pure, offline seed-path inventory. `SEED_PATHS` is a fixed 9-entry tuple a reviewer can read in full (`/`, `/robots.txt`, `/api`, `/rest`, `/login`, `/register`, `/swagger.json`, `/openapi.json`, `/.well-known/security.txt`); `seed_paths(base_url)` returns those paths as absolute URLs in seed order; `inventory_from_seeds(base_url, authorize)` returns only the URLs a caller-supplied `Callable[[str], bool]` approved, so `[]` when it approves nothing. A base must be an absolute `http(s)` URL with a host and no query or fragment, else `ValueError`; only trailing slashes are normalized, so no candidate has a doubled separator. Tests: `tests/test_endpoint_inventory.py` (36 cases).
+- ✅ The offline guarantee is **structural, not behavioral**: the tests parse the module with `ast` and assert its imports are exactly `__future__`, `collections.abc` and `urllib.parse`, that its only module-level functions are `_normalized_base`, `seed_paths` and `inventory_from_seeds`, and that no import-shaped mention of `requests`, `socket`, `urlopen`, `http_probe`, `probe_endpoint`, `probe_lab_target` or `diff_check` appears. Importing it pulls in no HTTP client and no database driver, so it cannot probe or store even if it wanted to.
+- ⚠️ **Dormant by design.** Nothing imports this module — it is not wired into the verifier, the summarizer, or any runner, and it makes no request and no write. Scope is decided by the caller's `authorize` callback (the same `Callable[[str], bool]` shape as `gateway.dns_pin.URLAuthorizer`), so this slice cannot widen authorization or the public-IP guard. It is an inventory *candidate list*, not a scan and not evidence: a candidate becomes a request only if a later, explicitly authorized probe asks for it.
+- Full suite at this milestone: `323 passed` (287 at the V3 milestone; the inventory slice added 36 cases).
+
 ## Standing practices (apply every session, every tool)
 
 - Point any new Cline/Copilot session at `ARCHITECTURE.md` instead of re-explaining the project
