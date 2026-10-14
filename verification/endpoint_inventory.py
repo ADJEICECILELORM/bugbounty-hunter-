@@ -52,6 +52,13 @@ def _normalized_base(base_url: str) -> str:
     quietly changing which URL gets authorized would be a security-relevant
     surprise. Only trailing slashes are removed, so joining cannot double a
     separator.
+
+    A base carrying userinfo (``https://user:pass@host``) is rejected as well.
+    Every candidate is built by concatenating this base, so credentials in the
+    authority would be copied into each one and could later be replayed, logged
+    or stored as evidence; a normalized target is precisely where they must
+    never appear. An ``@`` after the first ``/`` is a path character and is
+    left alone.
     """
     if not isinstance(base_url, str):
         raise ValueError("base_url must be a string")
@@ -61,6 +68,8 @@ def _normalized_base(base_url: str) -> str:
         raise ValueError(f"base_url must be http or https, got {scheme!r}")
     if not parsed.netloc:
         raise ValueError("base_url must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("base_url must not carry userinfo credentials")
     if parsed.query or parsed.fragment:
         raise ValueError("base_url must not carry a query or fragment")
     return urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))

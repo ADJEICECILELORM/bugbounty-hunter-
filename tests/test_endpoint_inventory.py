@@ -156,6 +156,56 @@ def test_seed_paths_rejects_a_query_or_fragment_rather_than_dropping_it(
         seed_paths(bad_base)
 
 
+@pytest.mark.parametrize(
+    "bad_base",
+    [
+        "http://user:pass@example.com",
+        "https://user@example.com",
+        "http://user:pass@127.0.0.1:3000",
+        "http://:pass@example.com",
+        "https://user:pass@example.com/rest",
+        "http://user:pass@example.com/?a=1",
+    ],
+)
+def test_seed_paths_rejects_a_base_that_carries_userinfo(bad_base: str) -> None:
+    """A credential in the authority must fail closed, not be copied onward."""
+    with pytest.raises(ValueError):
+        seed_paths(bad_base)
+
+
+def test_userinfo_is_rejected_before_the_callback_is_consulted() -> None:
+    """Fail closed at normalization: no candidate, and no authorization call."""
+    seen: list[str] = []
+
+    def authorize(url: str) -> bool:
+        seen.append(url)
+        return True
+
+    with pytest.raises(ValueError):
+        inventory_from_seeds("http://user:pass@example.com", authorize)
+
+    assert seen == []
+
+
+def test_an_at_sign_in_the_path_is_not_mistaken_for_userinfo() -> None:
+    """An ``@`` after the first ``/`` is a path character, not a credential."""
+    urls = seed_paths("http://example.com/a@b")
+
+    assert urls[0] == "http://example.com/a@b/"
+    assert urls[1] == "http://example.com/a@b/robots.txt"
+
+
+def test_no_candidate_ever_carries_userinfo() -> None:
+    """The authority of every candidate is bare host[:port]."""
+
+    def authority(url: str) -> str:
+        return url.split("/", 3)[2]
+
+    for base in ("http://example.com", "http://example.com/a@b", "https://e.com/x"):
+        for url in seed_paths(base):
+            assert "@" not in authority(url)
+
+
 
 # --- the authorized inventory ----------------------------------------------
 
