@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -75,8 +75,43 @@ class Task(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result_summary: Mapped[str | None] = mapped_column(String(2000))
+    depends_on: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
+    params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     investigation: Mapped[Investigation] = relationship(back_populates="tasks")
+    events: Mapped[list[TaskEvent]] = relationship(
+        back_populates="task", order_by="TaskEvent.id"
+    )
+
+
+class TaskEvent(Base):
+    """Append-only audit record of something that happened to a task.
+
+    Rows are only ever inserted: the ORM refuses to update or delete one (see
+    ``_refuse_task_event_mutation``), and no helper exists that would try.
+    """
+
+    __tablename__ = "task_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    task: Mapped[Task] = relationship(back_populates="events")
+
+
+class TaskEventIsAppendOnly(Exception):
+    """Raised when something tries to update or delete a ``TaskEvent`` row."""
+
+
+@event.listens_for(TaskEvent, "before_update")
+@event.listens_for(TaskEvent, "before_delete")
+def _refuse_task_event_mutation(_mapper: Any, _connection: Any, target: TaskEvent) -> None:
+    raise TaskEventIsAppendOnly(f"TaskEvent {target.id} is append-only")
 
 
 class Asset(Base):

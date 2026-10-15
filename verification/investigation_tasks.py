@@ -1,17 +1,19 @@
 """Operator-tracked tasks inside a running investigation.
 
-Four session functions and nothing else: ``create_task``, ``start_task``,
-``complete_task`` and ``list_tasks``. A ``Task`` is a record of work an operator
-has decided to do, not a job: nothing in this module (or anywhere in the
-project) picks a task up and runs it. Every transition happens only because an
-operator called one of these functions.
+Session functions only: ``create_task``, ``start_task``, ``complete_task`` and
+``append_task_event`` write; ``list_tasks``, ``open_task_ids`` and
+``unmet_dependencies`` read. A ``Task`` is a record of work an operator has
+decided to do. The only thing that ever executes one is
+:func:`orchestration.task_runner.run_task`, and only when an operator calls it;
+nothing schedules, loops, or picks a task up on its own.
 
 The writers use ``session.add()``/``session.flush()`` and never commit - the
 caller owns the transaction. None of them touches a ``Hypothesis``, ``Finding``,
-``Verdict``, or ``Observation``, and the module imports nothing from the gateway
-and makes no request.
+``Verdict``, or ``Observation`` (``create_task`` *reads* an ``Asset`` or
+``Hypothesis`` to check a task's target belongs to its investigation), and the
+module imports nothing from the gateway and makes no request.
 
-Transitions::
+Transitions, each recorded as an append-only ``TaskEvent``::
 
     pending --start_task--> running --complete_task--> completed | failed | cancelled
     pending --complete_task(final_status="cancelled")--> cancelled
@@ -21,29 +23,61 @@ running task; a pending task can only be ``cancelled``. Terminal tasks never
 change again. While any task is pending or running,
 :func:`verification.investigation_lifecycle.close_investigation` refuses to close
 its investigation, so a closed investigation never has an open task.
+
+``depends_on`` may only name tasks that already exist in the same investigation,
+so every dependency points at an earlier task and the graph is acyclic by
+construction.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from data.models import Investigation, Task
+from data.models import Asset, Hypothesis, Investigation, Task, TaskEvent
 
 # Mirrors ``investigation_lifecycle.RUNNING``; kept local so the lifecycle module
 # can import from this one without a cycle (a test asserts the two agree).
 INVESTIGATION_RUNNING = "running"
 
+# Hard cap on how many tasks one investigation may hold. A module constant
+# rather than a column, so the existing ``investigations`` table is unchanged and
+# older databases keep opening.
+MAX_TASKS_PER_INVESTIGATION = 50
+
 TASK_KINDS = frozenset(
-    {"recon", "inventory", "hypothesis_review", "verification", "report"}
+    {
+        "recon",
+        "inventory",
+        "hypothesis_generation",
+        "hypothesis_review",
+        "verification",
+        "report",
+    }
 )
+
+# The exact target parameters each kind takes; a kind missing here takes none.
+# Only ids and a base URL - never a header, token, credential, or lab opt-in.
+TASK_PARAMS: Mapping[str, frozenset[str]] = {
+    "inventory": frozenset({"asset_id", "base_url"}),
+    "hypothesis_generation": frozenset({"asset_id"}),
+    "verification": frozenset({"hypothesis_id"}),
+}
 
 PENDING = "pending"
 RUNNING = "running"
+COMPLETED = "completed"
 OPEN_STATUSES = frozenset({PENDING, RUNNING})
-FINAL_STATUSES = frozenset({"completed", "cancelled", "failed"})
+FINAL_STATUSES = frozenset({COMPLETED, "cancelled", "failed"})
+
+EVENT_TYPES = frozenset(
+    {"created", "started", *FINAL_STATUSES, "dispatched", "dispatch_failed"}
+)
 
 
 def create_task(
@@ -52,12 +86,17 @@ def create_task(
     *,
     kind: str,
     title: str,
+    params: Mapping[str, Any] | None = None,
+    depends_on: list[int] | None = None,
 ) -> Task:
     """Add a ``pending`` task to a running investigation and flush it.
 
     Raises :class:`ValueError` for a ``kind`` outside ``TASK_KINDS``, a blank
-    ``title``, or an investigation that is not running, and
-    :class:`LookupError` for a missing investigation. Does not commit.
+    ``title``, ``params`` that are not exactly the kind's ``TASK_PARAMS`` or name
+    a target outside this investigation, a ``depends_on`` entry that is not an
+    existing task of this investigation, an investigation that is not running,
+    or one that already holds ``MAX_TASKS_PER_INVESTIGATION`` tasks.
+    :class:`LookupError` means a missing investigation. Does not commit.
     """
     if kind not in TASK_KINDS:
         raise ValueError(f"kind must be one of {sorted(TASK_KINDS)!r}, got {kind!r}")
@@ -73,11 +112,29 @@ def create_task(
             f"not {INVESTIGATION_RUNNING!r}"
         )
 
+    existing = session.scalar(
+        select(func.count(Task.id)).where(Task.investigation_id == investigation_id)
+    )
+    if existing >= MAX_TASKS_PER_INVESTIGATION:
+        raise ValueError(
+            f"Investigation {investigation_id} already holds "
+            f"{MAX_TASKS_PER_INVESTIGATION} tasks"
+        )
+
+    checked_params = _checked_params(kind, dict(params or {}), investigation_id, session)
+    checked_depends_on = _checked_depends_on(list(depends_on or []), investigation_id, session)
+
     task = Task(
-        investigation_id=investigation_id, kind=kind, title=title, status=PENDING
+        investigation_id=investigation_id,
+        kind=kind,
+        title=title,
+        status=PENDING,
+        params=checked_params,
+        depends_on=checked_depends_on,
     )
     session.add(task)
     session.flush()
+    _append(task, "created", {"kind": kind, "depends_on": checked_depends_on}, session)
     return task
 
 
@@ -94,6 +151,7 @@ def start_task(task_id: int, session: Session) -> Task:
     task.status = RUNNING
     task.started_at = datetime.now(UTC)
     session.flush()
+    _append(task, "started", {}, session)
     return task
 
 
@@ -128,7 +186,26 @@ def complete_task(
     task.ended_at = datetime.now(UTC)
     task.result_summary = result_summary
     session.flush()
+    _append(task, final_status, {"result_summary": result_summary}, session)
     return task
+
+
+def append_task_event(
+    task_id: int,
+    session: Session,
+    *,
+    event_type: str,
+    detail: Mapping[str, Any] | None = None,
+) -> TaskEvent:
+    """Insert one ``TaskEvent`` for a task. Insert-only; there is no update path.
+
+    ``event_type`` must be one of ``EVENT_TYPES``. Does not commit.
+    """
+    if event_type not in EVENT_TYPES:
+        raise ValueError(
+            f"event_type must be one of {sorted(EVENT_TYPES)!r}, got {event_type!r}"
+        )
+    return _append(_get_task(task_id, session), event_type, dict(detail or {}), session)
 
 
 def list_tasks(investigation_id: int, session: Session) -> list[Task]:
@@ -154,6 +231,89 @@ def open_task_ids(investigation_id: int, session: Session) -> list[int]:
             .order_by(Task.id)
         )
     )
+
+
+def unmet_dependencies(task: Task, session: Session) -> list[int]:
+    """Return the ids in ``task.depends_on`` that are not ``completed``. Read-only."""
+    if not task.depends_on:
+        return []
+    completed = set(
+        session.scalars(
+            select(Task.id).where(
+                Task.id.in_(task.depends_on), Task.status == COMPLETED
+            )
+        )
+    )
+    return [task_id for task_id in task.depends_on if task_id not in completed]
+
+
+def _checked_params(
+    kind: str, params: dict[str, Any], investigation_id: int, session: Session
+) -> dict[str, Any]:
+    expected = TASK_PARAMS.get(kind, frozenset())
+    if set(params) != expected:
+        raise ValueError(
+            f"{kind!r} tasks take params {sorted(expected)!r}, got {sorted(params)!r}"
+        )
+    for key in expected & {"asset_id", "hypothesis_id"}:
+        if type(params[key]) is not int:
+            raise ValueError(f"{key} must be an int")
+
+    if "asset_id" in params:
+        asset = session.get(Asset, params["asset_id"])
+        if asset is None or asset.investigation_id != investigation_id:
+            raise ValueError(
+                f"Asset {params['asset_id']} is not part of "
+                f"investigation {investigation_id}"
+            )
+        if "base_url" in params:
+            base_url = params["base_url"]
+            if not isinstance(base_url, str) or (
+                (urlsplit(base_url).hostname or "") != asset.hostname.lower()
+            ):
+                raise ValueError(
+                    f"base_url must be a URL on the asset's host {asset.hostname!r}"
+                )
+
+    if "hypothesis_id" in params:
+        hypothesis = session.get(Hypothesis, params["hypothesis_id"])
+        if hypothesis is None or hypothesis.asset.investigation_id != investigation_id:
+            raise ValueError(
+                f"Hypothesis {params['hypothesis_id']} is not part of "
+                f"investigation {investigation_id}"
+            )
+    return params
+
+
+def _checked_depends_on(
+    depends_on: list[int], investigation_id: int, session: Session
+) -> list[int]:
+    if any(type(task_id) is not int for task_id in depends_on):
+        raise ValueError("depends_on must be a list of task ids")
+    wanted = sorted(set(depends_on))
+    found = set(
+        session.scalars(
+            select(Task.id).where(
+                Task.id.in_(wanted), Task.investigation_id == investigation_id
+            )
+        )
+    )
+    missing = [task_id for task_id in wanted if task_id not in found]
+    if missing:
+        raise ValueError(
+            f"depends_on names tasks {missing!r} that are not part of "
+            f"investigation {investigation_id}"
+        )
+    return wanted
+
+
+def _append(
+    task: Task, event_type: str, detail: dict[str, Any], session: Session
+) -> TaskEvent:
+    task_event = TaskEvent(event_type=event_type, detail=detail)
+    task.events.append(task_event)
+    session.flush()
+    return task_event
 
 
 def _get_task(task_id: int, session: Session) -> Task:

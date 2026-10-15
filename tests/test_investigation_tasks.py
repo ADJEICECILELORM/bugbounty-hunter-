@@ -19,7 +19,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from data.db import init_db
-from data.models import Investigation, Program, Task
+from data.models import Asset, Hypothesis, Investigation, Program, Task
 from verification import investigation_lifecycle
 from verification.investigation_lifecycle import (
     OpenTasksError,
@@ -93,7 +93,7 @@ def test_create_task_adds_a_pending_row_to_the_investigation(
 def test_start_task_moves_pending_to_running_and_sets_started_at(
     session: Session, investigation: Investigation
 ) -> None:
-    task = create_task(investigation.id, session, kind="inventory", title="Seeds")
+    task = create_task(investigation.id, session, kind="recon", title="Seeds")
 
     started = start_task(task.id, session)
 
@@ -107,7 +107,7 @@ def test_start_task_moves_pending_to_running_and_sets_started_at(
 def test_complete_task_ends_a_running_task(
     session: Session, investigation: Investigation, final_status: str
 ) -> None:
-    task = create_task(investigation.id, session, kind="verification", title="Plan 1")
+    task = create_task(investigation.id, session, kind="recon", title="Plan 1")
     start_task(task.id, session)
 
     completed = complete_task(
@@ -147,8 +147,29 @@ def test_list_tasks_returns_only_this_investigation_in_creation_order(
 def test_every_allowlisted_kind_is_accepted(
     session: Session, investigation: Investigation
 ) -> None:
+    asset = Asset(investigation_id=investigation.id, hostname="example.test")
+    session.add(asset)
+    session.flush()
+    hypothesis = Hypothesis(
+        asset_id=asset.id, category="authz", description="x", status="unverified"
+    )
+    session.add(hypothesis)
+    session.flush()
+
+    params_by_kind = {
+        "inventory": {"asset_id": asset.id, "base_url": "https://example.test/"},
+        "hypothesis_generation": {"asset_id": asset.id},
+        "verification": {"hypothesis_id": hypothesis.id},
+    }
     for kind in sorted(TASK_KINDS):
-        assert create_task(investigation.id, session, kind=kind, title=kind).kind == kind
+        created = create_task(
+            investigation.id,
+            session,
+            kind=kind,
+            title=kind,
+            params=params_by_kind.get(kind),
+        )
+        assert created.kind == kind
 
 
 # --- rejections ------------------------------------------------------------
@@ -350,12 +371,15 @@ def test_the_task_module_imports_only_the_session_layer_and_its_models() -> None
 
     assert imported == {
         "__future__",
+        "collections.abc",
         "datetime",
+        "typing",
+        "urllib.parse",
         "sqlalchemy",
         "sqlalchemy.orm",
         "data.models",
     }
-    assert model_names == {"Investigation", "Task"}
+    assert model_names == {"Asset", "Hypothesis", "Investigation", "Task", "TaskEvent"}
 
 
 def test_the_task_module_has_no_commit_or_side_effect_path() -> None:
