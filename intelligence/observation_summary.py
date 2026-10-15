@@ -27,9 +27,13 @@ Untrusted handling rules, in full:
   by position in the generated source label. Nothing is dropped - entries of an
   unrecognized observation type simply arrive as untrusted items rather than as
   trusted scalar lines - so the rule stays conservative as new types are added.
-* A type listed in :data:`_UNTRUSTED_OBSERVATION_TYPES` is rendered entirely as
-  untrusted text whatever its field names are: its evidence can never bind a
-  verdict, so no part of it needs a trusted scalar line.
+* :data:`_UNTRUSTED_OBSERVATION_TYPES` names observation types that must be
+  rendered entirely as untrusted text whatever their field names are; it is
+  currently empty. ``endpoint_inventory`` rows are instead split by field: their
+  system-derived scalars (the requested ``url``, ``status_code``,
+  ``content_length``, ``body_sha256``, ``response_time_ms``) enter the trusted
+  text, while the response ``headers`` - names and values alike, which the
+  target chooses - stay :class:`~intelligence.llm_client.UntrustedText`.
 * Source labels are therefore assembled only from this module's fixed vocabulary
   plus numeric positions, so target-controlled text can never reach a label.
 """
@@ -79,12 +83,13 @@ _KNOWN_FIELDS = frozenset(
     }
 )
 
-# Observation types whose entire rendering stays out of the trusted text. These
-# are context this module passes along and nothing may judge, so none of their
-# fields needs a trusted line - and the rule is on the type rather than on the
-# field names, so a future collector cannot make a target-derived candidate URL
-# trusted just by giving it a name this module already knows.
-_UNTRUSTED_OBSERVATION_TYPES = frozenset({"endpoint_inventory"})
+# Observation types whose *entire* rendering must stay out of the trusted text.
+# ``endpoint_inventory`` is deliberately absent here: its system-derived scalars
+# (url, status, length, hash, elapsed time) are safe to trust, and only its
+# target-chosen header names/values need the untrusted boundary, which the
+# per-field vocabulary already provides. This set stays as a safety hatch for a
+# future type that must never yield a trusted line; it is empty today.
+_UNTRUSTED_OBSERVATION_TYPES: frozenset[str] = frozenset()
 
 _ABSENT = "(absent)"
 

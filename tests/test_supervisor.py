@@ -132,6 +132,19 @@ def test_planner_never_returns_more_than_the_cap(
     assert len(ready) == MAX_TASKS_PER_INVESTIGATION
 
 
+def test_planner_respects_a_lowered_per_investigation_budget(
+    session: Session, investigation
+) -> None:
+    for index in range(5):
+        make_task(session, investigation, title=f"x{index}")
+
+    investigation.max_tasks = 3
+    session.flush()
+
+    ready = plan_next_tasks(investigation.id, session)
+    assert len(ready) == 3
+
+
 def test_supervisor_is_propose_only() -> None:
     source = SUPERVISOR_PATH.read_text(encoding="utf-8")
 

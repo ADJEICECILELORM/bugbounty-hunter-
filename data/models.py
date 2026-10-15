@@ -41,6 +41,14 @@ class Investigation(Base):
     )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Per-investigation budget overrides. ``None`` means "use the module default"
+    # (see ``verification.investigation_tasks.MAX_TASKS_PER_INVESTIGATION`` and
+    # ``MAX_LLM_CALLS_PER_INVESTIGATION``). Nullable with the default in code
+    # rather than the schema, so the already-populated ``lab_evidence_v3.db`` -
+    # which ``data.db.init_db`` never migrates - keeps opening without a back-fill.
+    max_tasks: Mapped[int | None] = mapped_column(nullable=True)
+    max_llm_calls: Mapped[int | None] = mapped_column(nullable=True)
+
     program: Mapped[Program] = relationship(back_populates="investigations")
     assets: Mapped[list[Asset]] = relationship(
         back_populates="investigation", cascade="all, delete-orphan"

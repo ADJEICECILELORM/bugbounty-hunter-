@@ -48,10 +48,16 @@ from data.models import Asset, Hypothesis, Investigation, Task, TaskEvent
 # can import from this one without a cycle (a test asserts the two agree).
 INVESTIGATION_RUNNING = "running"
 
-# Hard cap on how many tasks one investigation may hold. A module constant
-# rather than a column, so the existing ``investigations`` table is unchanged and
-# older databases keep opening.
+# Default caps for one investigation's work budget. ``Investigation`` carries a
+# nullable ``max_tasks`` / ``max_llm_calls`` override; a NULL column falls back to
+# these defaults, so the already-populated database keeps opening without a
+# back-fill. Both are enforced here in ``create_task`` - the only writer of tasks.
 MAX_TASKS_PER_INVESTIGATION = 50
+MAX_LLM_CALLS_PER_INVESTIGATION = 10
+
+# A ``hypothesis_generation`` task is the only production path to the model, so
+# counting those tasks is a deterministic record of LLM usage with no new column.
+LLM_TASK_KIND = "hypothesis_generation"
 
 TASK_KINDS = frozenset(
     {
@@ -65,12 +71,19 @@ TASK_KINDS = frozenset(
 )
 
 # The exact target parameters each kind takes; a kind missing here takes none.
-# Only ids and a base URL - never a header, token, credential, or lab opt-in.
+# Only ids and a base URL - never a header, token, credential, or lab opt-in. A
+# ``verification`` task must name a hypothesis in its investigation; no other
+# kind may carry a ``hypothesis_id``.
 TASK_PARAMS: Mapping[str, frozenset[str]] = {
     "inventory": frozenset({"asset_id", "base_url"}),
     "hypothesis_generation": frozenset({"asset_id"}),
     "verification": frozenset({"hypothesis_id"}),
 }
+
+
+class BudgetExhausted(ValueError):
+    """Raised when creating a task would exceed an investigation's budget."""
+
 
 PENDING = "pending"
 RUNNING = "running"
@@ -103,11 +116,15 @@ def create_task(
     """Add a ``pending`` task to a running investigation and flush it.
 
     Raises :class:`ValueError` for a ``kind`` outside ``TASK_KINDS``, a blank
-    ``title``, ``params`` that are not exactly the kind's ``TASK_PARAMS`` or name
-    a target outside this investigation, a ``depends_on`` entry that is not an
+    ``title``, ``params`` that are not exactly the kind's ``TASK_PARAMS`` (a
+    ``verification`` task requires a positive ``hypothesis_id`` on a hypothesis in
+    this investigation; ``hypothesis_id`` is forbidden on other kinds) or name a
+    target outside this investigation, a ``depends_on`` entry that is not an
     existing task of this investigation, an investigation that is not running,
-    or one that already holds ``MAX_TASKS_PER_INVESTIGATION`` tasks.
-    :class:`LookupError` means a missing investigation. Does not commit.
+    or one whose task or LLM-call budget is exhausted (:class:`BudgetExhausted`,
+    driven by ``Investigation.max_tasks`` / ``Investigation.max_llm_calls`` with
+    the module defaults). :class:`LookupError` means a missing investigation.
+    Does not commit.
     """
     if kind not in TASK_KINDS:
         raise ValueError(f"kind must be one of {sorted(TASK_KINDS)!r}, got {kind!r}")
@@ -126,11 +143,35 @@ def create_task(
     existing = session.scalar(
         select(func.count(Task.id)).where(Task.investigation_id == investigation_id)
     )
-    if existing >= MAX_TASKS_PER_INVESTIGATION:
-        raise ValueError(
-            f"Investigation {investigation_id} already holds "
-            f"{MAX_TASKS_PER_INVESTIGATION} tasks"
+    max_tasks = (
+        investigation.max_tasks
+        if investigation.max_tasks is not None
+        else MAX_TASKS_PER_INVESTIGATION
+    )
+    if existing >= max_tasks:
+        raise BudgetExhausted(
+            f"Investigation {investigation_id} task budget exhausted: it already "
+            f"holds {existing} of {max_tasks} tasks"
         )
+
+    if kind == LLM_TASK_KIND:
+        llm_tasks = session.scalar(
+            select(func.count(Task.id)).where(
+                Task.investigation_id == investigation_id,
+                Task.kind == LLM_TASK_KIND,
+            )
+        )
+        max_llm_calls = (
+            investigation.max_llm_calls
+            if investigation.max_llm_calls is not None
+            else MAX_LLM_CALLS_PER_INVESTIGATION
+        )
+        if llm_tasks >= max_llm_calls:
+            raise BudgetExhausted(
+                f"Investigation {investigation_id} LLM call budget exhausted: "
+                f"{llm_tasks} of {max_llm_calls} hypothesis_generation tasks "
+                "already recorded"
+            )
 
     checked_params = _checked_params(kind, dict(params or {}), investigation_id, session)
     checked_depends_on = _checked_depends_on(list(depends_on or []), investigation_id, session)
@@ -287,6 +328,8 @@ def _checked_params(
                 )
 
     if "hypothesis_id" in params:
+        if params["hypothesis_id"] <= 0:
+            raise ValueError("hypothesis_id must be a positive int")
         hypothesis = session.get(Hypothesis, params["hypothesis_id"])
         if hypothesis is None or hypothesis.asset.investigation_id != investigation_id:
             raise ValueError(

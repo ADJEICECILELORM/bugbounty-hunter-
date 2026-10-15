@@ -30,9 +30,11 @@ def plan_next_tasks(investigation_id: int, session: Session) -> list[Task]:
 
     A task is "ready" when it is pending and every id in ``depends_on`` names a
     completed task of this investigation. Results are ordered by ``Task.id``, so
-    the same state always yields the same list. Returns at most
-    ``MAX_TASKS_PER_INVESTIGATION`` rows; ``create_task`` already refuses to add
-    more than that, so the slice is a defensive bound rather than new policy.
+    the same state always yields the same list. Returns at most the
+    investigation's task budget (``Investigation.max_tasks``, or
+    ``MAX_TASKS_PER_INVESTIGATION`` when unset); ``create_task`` already refuses
+    to add more than that, so the slice is a defensive bound rather than new
+    policy.
 
     Raises :class:`LookupError` for a missing investigation. Read-only: nothing
     is executed, written, or committed.
@@ -52,4 +54,9 @@ def plan_next_tasks(investigation_id: int, session: Session) -> list[Task]:
         )
     )
     ready = [task for task in pending if not unmet_dependencies(task, session)]
-    return ready[:MAX_TASKS_PER_INVESTIGATION]
+    max_tasks = (
+        investigation.max_tasks
+        if investigation.max_tasks is not None
+        else MAX_TASKS_PER_INVESTIGATION
+    )
+    return ready[:max_tasks]

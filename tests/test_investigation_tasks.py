@@ -29,9 +29,12 @@ from verification.investigation_lifecycle import (
 from verification.investigation_tasks import (
     FINAL_STATUSES,
     INVESTIGATION_RUNNING,
+    LLM_TASK_KIND,
+    MAX_LLM_CALLS_PER_INVESTIGATION,
     PENDING,
     RUNNING,
     TASK_KINDS,
+    BudgetExhausted,
     complete_task,
     create_task,
     list_tasks,
@@ -352,6 +355,182 @@ def test_no_task_writer_commits_the_session(
     session.rollback()
     assert session.query(Task).count() == 0
     assert session.query(Investigation).count() == 0
+
+
+# --- structural guards -----------------------------------------------------
+
+
+def _seed_hypothesis(
+    session: Session, investigation: Investigation, hostname: str = "example.test"
+) -> Hypothesis:
+    asset = Asset(investigation_id=investigation.id, hostname=hostname)
+    session.add(asset)
+    session.flush()
+    hypothesis = Hypothesis(
+        asset_id=asset.id, category="authz", description="x", status="unverified"
+    )
+    session.add(hypothesis)
+    session.flush()
+    return hypothesis
+
+
+# --- Feature 2: verification tasks require a positive hypothesis_id --------
+
+
+def test_verification_task_requires_a_hypothesis_id(
+    session: Session, investigation: Investigation
+) -> None:
+    with pytest.raises(ValueError, match="params"):
+        create_task(investigation.id, session, kind="verification", title="v", params={})
+    assert session.query(Task).count() == 0
+
+
+def test_verification_task_rejects_a_non_positive_hypothesis_id(
+    session: Session, investigation: Investigation
+) -> None:
+    for bad in (0, -3):
+        with pytest.raises(ValueError, match="positive"):
+            create_task(
+                investigation.id,
+                session,
+                kind="verification",
+                title="v",
+                params={"hypothesis_id": bad},
+            )
+    assert session.query(Task).count() == 0
+
+
+def test_verification_task_rejects_a_hypothesis_from_another_investigation(
+    session: Session, investigation: Investigation
+) -> None:
+    other = start_investigation(investigation.program_id, session)
+    hypothesis = _seed_hypothesis(session, other)
+
+    with pytest.raises(ValueError, match="not part of"):
+        create_task(
+            investigation.id,
+            session,
+            kind="verification",
+            title="v",
+            params={"hypothesis_id": hypothesis.id},
+        )
+
+
+def test_hypothesis_id_is_forbidden_on_other_kinds(
+    session: Session, investigation: Investigation
+) -> None:
+    hypothesis = _seed_hypothesis(session, investigation)
+
+    with pytest.raises(ValueError, match="params"):
+        create_task(
+            investigation.id,
+            session,
+            kind="inventory",
+            title="i",
+            params={
+                "asset_id": hypothesis.asset_id,
+                "base_url": "https://example.test/",
+                "hypothesis_id": hypothesis.id,
+            },
+        )
+    assert session.query(Task).count() == 0
+
+
+def test_inventory_kind_still_works_without_a_hypothesis_id(
+    session: Session, investigation: Investigation
+) -> None:
+    asset = Asset(investigation_id=investigation.id, hostname="example.test")
+    session.add(asset)
+    session.flush()
+
+    task = create_task(
+        investigation.id,
+        session,
+        kind="inventory",
+        title="i",
+        params={"asset_id": asset.id, "base_url": "https://example.test/"},
+    )
+    assert task.kind == "inventory"
+
+
+# --- Feature 4: hard task/LLM budgets --------------------------------------
+
+
+def test_create_task_respects_a_per_investigation_task_budget(
+    session: Session, investigation: Investigation
+) -> None:
+    investigation.max_tasks = 2
+    session.flush()
+
+    create_task(investigation.id, session, kind="recon", title="a")
+    create_task(investigation.id, session, kind="recon", title="b")
+
+    with pytest.raises(BudgetExhausted, match="task budget exhausted"):
+        create_task(investigation.id, session, kind="recon", title="c")
+
+
+def test_llm_budget_refuses_before_any_model_call(
+    session: Session, investigation: Investigation
+) -> None:
+    investigation.max_llm_calls = 1
+    session.flush()
+    asset = Asset(investigation_id=investigation.id, hostname="example.test")
+    session.add(asset)
+    session.flush()
+
+    create_task(
+        investigation.id,
+        session,
+        kind=LLM_TASK_KIND,
+        title="g1",
+        params={"asset_id": asset.id},
+    )
+
+    with pytest.raises(BudgetExhausted, match="LLM call budget exhausted"):
+        create_task(
+            investigation.id,
+            session,
+            kind=LLM_TASK_KIND,
+            title="g2",
+            params={"asset_id": asset.id},
+        )
+
+
+def test_llm_budget_does_not_block_non_llm_tasks(
+    session: Session, investigation: Investigation
+) -> None:
+    investigation.max_llm_calls = 0
+    session.flush()
+
+    task = create_task(investigation.id, session, kind="recon", title="r")
+    assert task.kind == "recon"
+
+
+def test_default_llm_budget_is_the_module_constant(
+    session: Session, investigation: Investigation
+) -> None:
+    assert investigation.max_llm_calls is None
+    asset = Asset(investigation_id=investigation.id, hostname="example.test")
+    session.add(asset)
+    session.flush()
+
+    for index in range(MAX_LLM_CALLS_PER_INVESTIGATION):
+        create_task(
+            investigation.id,
+            session,
+            kind=LLM_TASK_KIND,
+            title=f"g{index}",
+            params={"asset_id": asset.id},
+        )
+
+    with pytest.raises(BudgetExhausted, match="LLM call budget exhausted"):
+        create_task(
+            investigation.id,
+            session,
+            kind=LLM_TASK_KIND,
+            title="overflow",
+            params={"asset_id": asset.id},
+        )
 
 
 # --- structural guards -----------------------------------------------------
