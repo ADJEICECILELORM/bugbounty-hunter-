@@ -58,6 +58,12 @@ Close policy: **strict block.** `close_investigation()` raises `OpenTasksError` 
 
 The schema change is additive: `init_db()` creates the new `tasks` table and alters no existing table or column (verified on a `/tmp` copy of `lab_evidence_v3.db`).
 
+### Operator runs own an investigation and its tasks
+
+An operator script can now own the whole container, not just record a task. `orchestration.session_helpers.ensure_running_investigation()` returns a running `Investigation` (starting one from a `program_id` when only a program is given), and `orchestration.session_helpers.run_under_investigation()` then creates a task through `create_task` and runs it — either by dispatching its `kind` through `orchestration.task_runner.run_task` (for kinds already in `DISPATCH_TARGETS`) or by calling the operator's `work` callable and completing the task. Both helpers flush only; the caller (the script) commits. `scripts/collect_inventory.py` is the first wiring: it opens or starts an investigation, ensures an `Asset` for the target host, and runs the existing `collect_seed_inventory()` as an `inventory` task — so a live collector run leaves a durable `Investigation`, `Asset`, and `Task`, and still never promotes a hypothesis.
+
+Those tasks are the same records V5 recovery operates on: `verification.task_recovery.find_stuck_tasks()` lists an investigation's overrun `running` tasks, and `scripts/recover_investigation.py --mark-failed` / `--retry` repair them through the same task layer. Recovery stays human-initiated — there is still no scheduler, daemon, or auto-retry.
+
 ## Data Flow
 
 1. `gateway.program_config.load_program()` loads and validates YAML program metadata and scope patterns.

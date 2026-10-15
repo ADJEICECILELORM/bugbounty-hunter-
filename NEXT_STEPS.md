@@ -138,3 +138,8 @@ Documented, non-exploitable observations:
 ## After V1
 
 Per your roadmap, V2 is investigation intelligence. Hypothesis generation, untrusted-aware observation summarization, and deterministic prioritization are now built and tested (see "V2 — Investigation intelligence"), so V2 produces ranked *candidates*. V3 closes the second gap identified here: a human can now run a gated verification plan against a chosen hypothesis, get a deterministic verdict, promote it to a finding with a named approver, and render a local Markdown report (see "V3 — Controlled verification"). The thing still open before this feels like a real system is the endpoint/asset inventory step, so the summarizer and the verifier have more than one probe's worth of context to work with: that step now has both halves — the offline candidate list (`af557d0`) and the guarded collector that turns an approved candidate into a stored, asset-level observation (`2f7fd55`) — but the collector is dormant, nothing feeds a stored inventory row back into a probe plan, and no live collector run has been made.
+
+## V6 — Operator task ownership (status)
+
+- ✅ `orchestration/session_helpers.py` — `ensure_running_investigation()` and `run_under_investigation()` let one operator path own a running `Investigation` and a `Task` (create + dispatch via `run_task`, or run a `work` callable and complete) without re-implementing the lifecycle/task layers; both flush only.
+- ✅ `scripts/collect_inventory.py` — the first wired script: opens or starts an investigation, ensures an `Asset`, and runs `collect_seed_inventory()` as an `inventory` task, leaving durable `Investigation`/`Asset`/`Task` rows; still never promotes a hypothesis. V5 recovery (`scripts/recover_investigation.py`) applies to those tasks.
