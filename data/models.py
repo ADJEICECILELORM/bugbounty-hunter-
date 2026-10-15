@@ -1,4 +1,4 @@
-"""SQLAlchemy models for programs, investigations, assets, and observations."""
+"""SQLAlchemy models for programs, investigations, tasks, assets, and observations."""
 
 from __future__ import annotations
 
@@ -45,6 +45,38 @@ class Investigation(Base):
     assets: Mapped[list[Asset]] = relationship(
         back_populates="investigation", cascade="all, delete-orphan"
     )
+    tasks: Mapped[list[Task]] = relationship(
+        back_populates="investigation",
+        cascade="all, delete-orphan",
+        order_by="Task.id",
+    )
+
+
+class Task(Base):
+    """One operator-tracked unit of work inside an investigation.
+
+    A task is a record, not a job: nothing executes it. Its ``status`` is
+    written only by :mod:`verification.investigation_tasks`, and only when an
+    operator calls one of its functions.
+    """
+
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    investigation_id: Mapped[int] = mapped_column(
+        ForeignKey("investigations.id"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result_summary: Mapped[str | None] = mapped_column(String(2000))
+
+    investigation: Mapped[Investigation] = relationship(back_populates="tasks")
 
 
 class Asset(Base):
