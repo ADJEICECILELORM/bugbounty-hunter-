@@ -25,8 +25,11 @@ change again. While any task is pending or running,
 its investigation, so a closed investigation never has an open task.
 
 ``depends_on`` may only name tasks that already exist in the same investigation,
-so every dependency points at an earlier task and the graph is acyclic by
-construction.
+and a task id is assigned only when its row is created (flushed), so a
+dependency can only point at an earlier id - a forward reference, and therefore
+a cycle, is impossible. That acyclicity is an emergent property of autoincrement
+ids plus the ``_checked_depends_on`` existence check, not a separate
+cycle-detection pass.
 """
 
 from __future__ import annotations
@@ -76,7 +79,15 @@ OPEN_STATUSES = frozenset({PENDING, RUNNING})
 FINAL_STATUSES = frozenset({COMPLETED, "cancelled", "failed"})
 
 EVENT_TYPES = frozenset(
-    {"created", "started", *FINAL_STATUSES, "dispatched", "dispatch_failed"}
+    {
+        "created",
+        "started",
+        *FINAL_STATUSES,
+        "dispatched",
+        "dispatch_failed",
+        "crash_recovery",
+        "retry_created",
+    }
 )
 
 
@@ -288,6 +299,14 @@ def _checked_params(
 def _checked_depends_on(
     depends_on: list[int], investigation_id: int, session: Session
 ) -> list[int]:
+    """Validate and normalize a task's dependency ids.
+
+    Every entry must be an int naming a task that already exists in this
+    investigation. Because a task id is assigned only when its row is created
+    (flushed), a dependency can only name an earlier task, so the dependency
+    graph is acyclic by construction - this is the *mechanism*, not a separate
+    cycle-detection pass.
+    """
     if any(type(task_id) is not int for task_id in depends_on):
         raise ValueError("depends_on must be a list of task ids")
     wanted = sorted(set(depends_on))
