@@ -43,6 +43,13 @@
 - ⚠️ **Dormant and unrun.** Nothing imports the collector: no CLI, no scheduler, no caller in the suite, and no live run against the lab (which is down). Wiring it up or running it is a separate, deliberate operator decision; it is not a step the suite takes.
 - Full suite with both halves committed: `349 passed` at `2f7fd55` (287 at the V3 milestone; 323 with the candidate list at `af557d0`, 332 after `ea17efa`), and `353 passed` after the render script at `a26a0fe`.
 
+## V4 — Persistent investigation lifecycle (status)
+
+- ✅ `verification/investigation_lifecycle.py` — the smallest slice of V4: exactly two session functions, `start_investigation(program_id, session)` and `close_investigation(investigation_id, session, *, final_status)`, and nothing else. `start_investigation` creates a `status='running'` `Investigation` row (rejecting an unknown program with `LookupError`) with `started_at` set; `close_investigation` sets a final `status` (`completed` or `cancelled`) and `ended_at`, raising `ValueError` for any other final status and `LookupError` for a missing investigation id. Both write with `session.add()`/`flush()` only and never commit; the caller owns the transaction.
+- ✅ **No schema change.** `Investigation` already carried `program_id`, `status`, `started_at`, and `ended_at`, so the slice needed no new column or table; `Investigation.status` is the separate lifecycle field, written only by this module, and is distinct from `Hypothesis.status` (written only by the promotion gate).
+- ✅ **No side effects.** The module imports nothing from the gateway, calls no model, makes no request, and never touches a `Hypothesis`, `Finding`, `Verdict`, or `Observation`; the tests assert this in the source and that neither function commits (a monkeypatched `commit` raises, and a rollback removes the flushed row).
+- Full suite at this slice: `363 passed` (353 at `a26a0fe`; 10 new in `tests/test_investigation_lifecycle.py`).
+
 ## Standing practices (apply every session, every tool)
 
 - Point any new Cline/Copilot session at `ARCHITECTURE.md` instead of re-explaining the project
