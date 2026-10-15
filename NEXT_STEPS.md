@@ -43,12 +43,17 @@
 - ⚠️ **Dormant and unrun.** Nothing imports the collector: no CLI, no scheduler, no caller in the suite, and no live run against the lab (which is down). Wiring it up or running it is a separate, deliberate operator decision; it is not a step the suite takes.
 - Full suite with both halves committed: `349 passed` at `2f7fd55` (287 at the V3 milestone; 323 with the candidate list at `af557d0`, 332 after `ea17efa`), and `353 passed` after the render script at `a26a0fe`.
 
-## V4 — Persistent investigation lifecycle (status)
+## V4 — Persistent investigation lifecycle and tasks (status)
 
 - ✅ `verification/investigation_lifecycle.py` — the smallest slice of V4: exactly two session functions, `start_investigation(program_id, session)` and `close_investigation(investigation_id, session, *, final_status)`, and nothing else. `start_investigation` creates a `status='running'` `Investigation` row (rejecting an unknown program with `LookupError`) with `started_at` set; `close_investigation` sets a final `status` (`completed` or `cancelled`) and `ended_at`, raising `ValueError` for any other final status and `LookupError` for a missing investigation id. Both write with `session.add()`/`flush()` only and never commit; the caller owns the transaction.
 - ✅ **No schema change.** `Investigation` already carried `program_id`, `status`, `started_at`, and `ended_at`, so the slice needed no new column or table; `Investigation.status` is the separate lifecycle field, written only by this module, and is distinct from `Hypothesis.status` (written only by the promotion gate).
 - ✅ **No side effects.** The module imports nothing from the gateway, calls no model, makes no request, and never touches a `Hypothesis`, `Finding`, `Verdict`, or `Observation`; the tests assert this in the source and that neither function commits (a monkeypatched `commit` raises, and a rollback removes the flushed row).
 - Full suite at this slice: `363 passed` (353 at `a26a0fe`; 10 new in `tests/test_investigation_lifecycle.py`).
+- ✅ `verification/investigation_tasks.py` + the `Task` model — the V4 orchestration foundation, committed as `4a4f704`. An investigation now owns tasks: `create_task` (running investigation only, `kind` from the fixed allowlist `recon`/`inventory`/`hypothesis_review`/`verification`/`report`, non-blank title, starts `pending`), `start_task` (`pending` → `running`, sets `started_at`), `complete_task` (`completed`/`failed` from `running`, `cancelled` from `pending` or `running`, sets `ended_at` and an optional `result_summary`), and read-only `list_tasks`. All writers flush and never commit, and none touches a hypothesis, finding, verdict, observation, or the network.
+- ✅ **Strict close policy.** `close_investigation()` now raises `OpenTasksError` while any task is pending or running and changes nothing; it never auto-cancels. A closed investigation therefore never has an open task.
+- ✅ **Additive schema change.** One new `tasks` table (9 columns, each justified in `ARCHITECTURE.md`) plus the `Investigation.tasks` relationship; no existing table or column changed, verified by running `init_db()` on a `/tmp` copy of `lab_evidence_v3.db`.
+- ⚠️ **Human-triggered only — no autonomous scheduling yet.** A task is a record, not a job. There is no scheduler, dispatcher, planner, supervisor loop, HTN/DAG engine, or message bus, and nothing links a task to the module that would perform it; the operator runs that module themselves and records the outcome.
+- Full suite at this slice: `402 passed` (363 before; 39 new in `tests/test_investigation_tasks.py`).
 
 ## Standing practices (apply every session, every tool)
 
