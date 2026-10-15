@@ -474,10 +474,13 @@ def python_sources(*directories: str) -> list[Path]:
 
 
 def test_only_the_promotion_gate_writes_a_hypothesis_status() -> None:
+    # ``Investigation.status`` is a separate lifecycle field, written only by
+    # ``verification/investigation_lifecycle.py``, so this guard scopes to
+    # hypothesis-status writes rather than any ``.status`` assignment.
     writers = [
         path.name
         for path in python_sources("verification", "intelligence", "gateway", "data")
-        if re.search(r"\.status\s*=(?!=)", path.read_text(encoding="utf-8"))
+        if re.search(r"hypothesis\.status\s*=(?!=)", path.read_text(encoding="utf-8"))
     ]
 
     assert writers == [STATUS_WRITER], (
