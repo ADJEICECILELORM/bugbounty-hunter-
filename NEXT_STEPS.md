@@ -164,4 +164,9 @@ Per your roadmap, V2 is investigation intelligence. Hypothesis generation, untru
 - ✅ `orchestration/status_board.py` — a pure, read-only view: `list_investigations(session)`, `get_investigation_status(session, investigation_id, *, threshold_seconds=3600)`, and `find_stuck_tasks(session, *, threshold_seconds=3600)` return dataclasses and never print, commit, or write a status; stuck detection matches `verification.task_recovery.find_stuck_tasks` so the board and the recovery path agree, and the schema is read defensively so the pre-task-model `lab_evidence_v3.db` still reports (0 tasks, defaults). `scripts/investigation_status.py` is the operator CLI (`--investigation ID`, `--threshold-seconds`, default 3600) that opens `lab_evidence_v3.db` with `mode=ro&uri=true` and only prints. No new network path, no promotion, no `run_task`. Tests: `tests/test_status_board.py` (14 cases).
 - Full suite at this slice: `507 passed` (uncommitted, awaiting review before commit).
 
+## V7 — LLM budget enforced at the model call (status)
+
+- ✅ `intelligence.hypothesis_generation.generate_hypotheses` now enforces the investigation's LLM-call budget before spending a token, closing the direct-call gap left by `create_task` alone. It counts `hypothesis_generation` tasks with the same NULL-fallback defaults but excludes the in-flight task `run_task` just marked `running`, so a dispatched task is not double-counted and a direct call raises `BudgetExhausted` once the budget is full. Tests: `tests/test_hypothesis_generation.py` (2 new cases: the direct-call refusal and the dispatched non-double-count).
+- Full suite at this slice: `509 passed`.
+
 
