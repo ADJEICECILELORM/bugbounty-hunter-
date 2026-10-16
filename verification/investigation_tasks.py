@@ -82,7 +82,7 @@ TASK_PARAMS: Mapping[str, frozenset[str]] = {
 
 
 class BudgetExhausted(ValueError):
-    """Raised when creating a task would exceed an investigation's budget."""
+    """Raised when work would exceed an investigation's task or LLM-call budget."""
 
 
 PENDING = "pending"

@@ -16,6 +16,12 @@ from intelligence.hypothesis_generation import (
     parse_hypothesis_lines,
 )
 from intelligence.llm_client import LLMClientError, UntrustedText
+from orchestration.task_runner import run_task
+from verification.investigation_tasks import (
+    LLM_TASK_KIND,
+    BudgetExhausted,
+    create_task,
+)
 
 HEADER_VALUE = 'W/"2eb-9kubiLGtNeEFmO88UVMd/XM30hU"'
 GOOD_RESPONSE = (
@@ -284,6 +290,59 @@ def test_asset_without_observations_makes_no_model_call(
         assert session.scalars(select(Hypothesis)).all() == []
 
     assert calls == []
+    engine.dispose()
+
+
+def test_direct_generation_is_refused_when_the_llm_budget_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = init_db("sqlite+pysqlite:///:memory:")
+    calls = _patch_completion(monkeypatch)
+
+    with Session(engine) as session:
+        asset = _seed_asset(session)
+        investigation = asset.investigation
+        investigation.max_llm_calls = 1
+        session.flush()
+        create_task(
+            investigation.id,
+            session,
+            kind=LLM_TASK_KIND,
+            title="exhaust the budget",
+            params={"asset_id": asset.id},
+        )
+
+        with pytest.raises(BudgetExhausted, match="LLM call budget exhausted"):
+            generate_hypotheses(asset.id, session)
+
+    assert calls == []
+    engine.dispose()
+
+
+def test_task_dispatched_generation_is_not_double_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = init_db("sqlite+pysqlite:///:memory:")
+    _patch_completion(monkeypatch)
+
+    with Session(engine) as session:
+        asset = _seed_asset(session)
+        investigation = asset.investigation
+        investigation.max_llm_calls = 1
+        session.flush()
+        task = create_task(
+            investigation.id,
+            session,
+            kind=LLM_TASK_KIND,
+            title="generation",
+            params={"asset_id": asset.id},
+        )
+
+        run_task(task.id, session)
+
+        assert task.status == "completed"
+        assert len(session.scalars(select(Hypothesis)).all()) == 2
+
     engine.dispose()
 
 

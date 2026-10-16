@@ -12,20 +12,28 @@ rule - a hypothesis is a candidate, not a finding:
 * it adds rows with ``session.add()`` and ``session.flush()`` but never commits -
   the caller owns the transaction, as in every other module here;
 * it lets :class:`~intelligence.llm_client.LLMClientError` propagate, so a failed
-  generation is visible to the caller instead of looking like "no hypotheses".
+  generation is visible to the caller instead of looking like "no hypotheses";
+* it enforces the investigation's LLM-call budget before spending a token, so a
+  direct call is refused with :class:`BudgetExhausted` once the budget is full.
 """
 
 from __future__ import annotations
 
 import re
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from data.models import Asset, Hypothesis, Observation
+from data.models import Asset, Hypothesis, Investigation, Observation, Task
 from intelligence.categories import normalize_category
 from intelligence.llm_client import generate_completion
 from intelligence.observation_summary import summarize_observations
+from verification.investigation_tasks import (
+    LLM_TASK_KIND,
+    MAX_LLM_CALLS_PER_INVESTIGATION,
+    RUNNING,
+    BudgetExhausted,
+)
 
 UNVERIFIED = "unverified"
 
@@ -116,6 +124,14 @@ def generate_hypotheses(asset_id: int, session: Session) -> list[Hypothesis]:
     :class:`~intelligence.llm_client.LLMClientError` propagate when the model
     call fails. An asset with no observations returns an empty list and makes no
     model call at all: with no evidence there is nothing to base a hypothesis on.
+
+    Before any model call it enforces the investigation's LLM-call budget by
+    counting ``hypothesis_generation`` tasks, the same proxy ``create_task``
+    uses. :func:`orchestration.task_runner.run_task` marks the dispatched task
+    ``running`` before calling this, so that in-flight task is excluded from the
+    count (its slot was already reserved at creation); a direct call is refused
+    with :class:`~verification.investigation_tasks.BudgetExhausted` once the
+    investigation already holds ``max_llm_calls`` such tasks.
     """
     asset = session.get(Asset, asset_id)
     if asset is None:
@@ -128,6 +144,31 @@ def generate_hypotheses(asset_id: int, session: Session) -> list[Hypothesis]:
     ).all()
     if not observations:
         return []
+
+    not_running_llm_tasks = session.scalar(
+        select(func.count(Task.id)).where(
+            Task.investigation_id == asset.investigation_id,
+            Task.kind == LLM_TASK_KIND,
+            Task.status != RUNNING,
+        )
+    )
+    investigation = session.get(Investigation, asset.investigation_id)
+    max_llm_calls = (
+        investigation.max_llm_calls
+        if investigation.max_llm_calls is not None
+        else MAX_LLM_CALLS_PER_INVESTIGATION
+    )
+    # ``run_task`` marks the dispatched task ``running`` before this runs, so a
+    # running task is the call being made right now rather than a prior spend;
+    # excluding it keeps the task path from double-counting its reserved slot. A
+    # direct call has no running task and is refused once the recorded tasks
+    # already fill the budget.
+    if not_running_llm_tasks + 1 > max_llm_calls:
+        raise BudgetExhausted(
+            f"Investigation {asset.investigation_id} LLM call budget exhausted: "
+            f"{not_running_llm_tasks} of {max_llm_calls} hypothesis_generation "
+            "tasks already recorded"
+        )
 
     summary = summarize_observations(
         observations,
