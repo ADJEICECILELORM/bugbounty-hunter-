@@ -136,6 +136,9 @@ def test_stuck_tasks_block_execute(
     assert "recover_investigation.py" in report.skipped[0].detail
     assert called == []
     assert ready.status == "pending"
+    assert stuck.status == "running"
+    assert stuck.ended_at is None
+    assert [event.event_type for event in ready.events] == ["created"]
 
 def test_empty_plan_is_ok(session: Session, investigation) -> None:
     report = cycle.run_supervised_cycle(investigation.id, session, execute=True)

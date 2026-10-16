@@ -26,6 +26,9 @@ from data.models import (
     Investigation,
     Observation,
     Program,
+    PromotionAudit,
+    Task,
+    TaskEvent,
     Verdict,
 )
 from verification.diff_check import build_diff_result
@@ -144,19 +147,31 @@ def test_package_is_read_only_toward_the_database(
     tmp_path: Path, session: Session
 ) -> None:
     finding = promote_one_finding(session)
+    tables = (
+        Program,
+        Investigation,
+        Task,
+        TaskEvent,
+        Asset,
+        Hypothesis,
+        Observation,
+        Verdict,
+        Finding,
+        PromotionAudit,
+    )
     before = {
-        "findings": session.scalar(select(func.count(Finding.id))),
-        "verdicts": session.scalar(select(func.count(Verdict.id))),
-        "observations": session.scalar(select(func.count(Observation.id))),
+        table.__name__: session.scalar(select(func.count(table.id)))
+        for table in tables
     }
     status_before = session.get(Hypothesis, finding.hypothesis_id).status
 
     build_report_package(session, finding.id, tmp_path / "finding.zip")
     session.expire_all()
 
-    assert session.scalar(select(func.count(Finding.id))) == before["findings"]
-    assert session.scalar(select(func.count(Verdict.id))) == before["verdicts"]
-    assert session.scalar(select(func.count(Observation.id))) == before["observations"]
+    for table in tables:
+        assert (
+            session.scalar(select(func.count(table.id))) == before[table.__name__]
+        ), f"{table.__name__} row count must not change"
     assert session.get(Hypothesis, finding.hypothesis_id).status == status_before
 
 

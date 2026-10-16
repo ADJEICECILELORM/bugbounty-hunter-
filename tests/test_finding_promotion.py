@@ -451,6 +451,33 @@ def test_a_supported_row_that_no_digest_binds_is_refused(session: Session) -> No
     assert session.scalars(select(Finding)).all() == []
 
 
+def test_promotion_is_refused_when_a_verdict_is_rebound_to_other_evidence(
+    session: Session,
+) -> None:
+    """A digest computed for one observation must not bind the verdict to another."""
+    hypothesis = seed_hypothesis(session)
+    _, original_verdict, _ = seed_supported_evidence(session, hypothesis)[:3]
+
+    other_observation, _, _ = record_pair(
+        session,
+        hypothesis,
+        BASKET_A,
+        BASKET_A,
+        probe(BASKET_A, body_sha256=SHA_OTHER),
+        probe(BASKET_A, body_sha256=SHA_OTHER),
+        CLAIM,
+    )
+
+    original_verdict.observation_id = other_observation.id
+
+    with pytest.raises(PromotionRefused) as error:
+        promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
+
+    assert "integrity" in str(error.value)
+    assert session.scalars(select(Finding)).all() == []
+    assert session.get(Hypothesis, hypothesis.id).status == "unverified"
+
+
 def test_promotion_leaves_the_transaction_to_the_caller(session: Session) -> None:
     hypothesis = seed_hypothesis(session)
     seed_supported_evidence(session, hypothesis)
@@ -476,10 +503,21 @@ def python_sources(*directories: str) -> list[Path]:
 def test_only_the_promotion_gate_writes_a_hypothesis_status() -> None:
     # ``Investigation.status`` is a separate lifecycle field, written only by
     # ``verification/investigation_lifecycle.py``, so this guard scopes to
-    # hypothesis-status writes rather than any ``.status`` assignment.
+    # hypothesis-status writes rather than any ``.status`` assignment. It scans
+    # every tracked Python source directory - not just the verification stack -
+    # so no module anywhere can slip a status write past the single promotion
+    # gate.
     writers = [
         path.name
-        for path in python_sources("verification", "intelligence", "gateway", "data")
+        for path in python_sources(
+            "verification",
+            "intelligence",
+            "gateway",
+            "data",
+            "orchestration",
+            "scripts",
+            "workers",
+        )
         if re.search(r"hypothesis\.status\s*=(?!=)", path.read_text(encoding="utf-8"))
     ]
 

@@ -414,6 +414,32 @@ def test_verification_task_rejects_a_hypothesis_from_another_investigation(
             title="v",
             params={"hypothesis_id": hypothesis.id},
         )
+    assert session.query(Task).count() == 0
+
+
+def test_verification_task_rejects_a_hypothesis_from_another_program(
+    session: Session, investigation: Investigation
+) -> None:
+    other_program = Program(
+        name="Another Program",
+        authorized_scope=["*.other.test"],
+        excluded_scope=[],
+        rate_limit=10,
+    )
+    session.add(other_program)
+    session.flush()
+    other = start_investigation(other_program.id, session)
+    hypothesis = _seed_hypothesis(session, other)
+
+    with pytest.raises(ValueError, match="not part of"):
+        create_task(
+            investigation.id,
+            session,
+            kind="verification",
+            title="v",
+            params={"hypothesis_id": hypothesis.id},
+        )
+    assert session.query(Task).count() == 0
 
 
 def test_hypothesis_id_is_forbidden_on_other_kinds(
@@ -467,6 +493,8 @@ def test_create_task_respects_a_per_investigation_task_budget(
 
     with pytest.raises(BudgetExhausted, match="task budget exhausted"):
         create_task(investigation.id, session, kind="recon", title="c")
+
+    assert session.query(Task).count() == 2
 
 
 def test_llm_budget_refuses_before_any_model_call(
