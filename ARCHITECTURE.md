@@ -66,6 +66,17 @@ An operator script can now own the whole container, not just record a task. `orc
 
 Those tasks are the same records V5 recovery operates on: `verification.task_recovery.find_stuck_tasks()` lists an investigation's overrun `running` tasks, and `scripts/recover_investigation.py --mark-failed` / `--retry` repair them through the same task layer. Recovery stays human-initiated — there is still no scheduler, daemon, or auto-retry.
 
+## V6 Scope (first slice)
+
+The V6 first slice is a **supervised cycle**, not an autonomous loop: one explicit operator invocation proposes an investigation's ready tasks and, only when told to, runs them once each — then stops. `orchestration.supervised_cycle.run_supervised_cycle(investigation_id, session, *, execute, threshold_seconds=3600.0, authorize=None, allow_private_network=False, verification_plan=None)` is the single library entry point:
+
+* **Planning always, executing gated.** It calls `plan_next_tasks` even for a dry run (`execute=False`), which returns exactly the proposals and writes nothing. `execute=True` refuses a non-`running` investigation (`ValueError`) and returns without running while any task is stuck (`find_stuck_tasks`), telling the operator to run `scripts/recover_investigation.py` first.
+* **Budgets respected, never bypassed.** `plan_next_tasks` slices to `Investigation.max_tasks` and `create_task` enforces the task and LLM caps, so a cycle can only propose and run what the budget allows.
+* **Stop on first failure.** Proposed tasks run in order; the first `run_task` exception is recorded in the returned `CycleReport` and the cycle stops, so a failed dependency never cascades into later tasks.
+* **Flush only, no hypothesis.** The helper never commits and never writes `Hypothesis.status`; `scripts/run_supervised_investigation.py` is the operator entry point that commits once at the end.
+
+`scripts/run_supervised_investigation.py <id>` is a dry run (print the plan, exit 0, no writes). `--yes` runs one cycle; `--yes --max-cycles N` (N capped at 5) runs at most N cycles in one process, re-planning between them and stopping early when a cycle proposes nothing or hits the stop-on-first-failure policy. This is deliberately **not autonomous multi-agent operation yet**: there is no scheduler, daemon, free-running swarm, or automatic promotion.
+
 ## Data Flow
 
 1. `gateway.program_config.load_program()` loads and validates YAML program metadata and scope patterns.
