@@ -50,7 +50,7 @@ Close policy: **strict block.** `close_investigation()` raises `OpenTasksError` 
 
 - `id` — primary key, the handle every task function takes.
 - `investigation_id` — the owning investigation; the foreign key that makes an investigation a container and lets `close_investigation` find open work.
-- `kind` — one of the five allowlisted kinds, so a task names a known step of the existing lifecycle rather than free-form work.
+- `kind` — one of the six allowlisted kinds, so a task names a known step of the existing lifecycle rather than free-form work.
 - `status` — `pending`/`running`/`completed`/`cancelled`/`failed`, the transition state the functions guard and the close check reads.
 - `title` — the operator's human-readable description of the work; required and non-blank.
 - `created_at` — when the operator recorded the task; also a stable audit timestamp independent of whether it ever started.
