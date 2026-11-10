@@ -4,6 +4,29 @@
 
 V1 provides program configuration, scope enforcement, safe DNS resolution, passive DNS discovery, relational storage, and an explicit single-request HTTP probe for controlled verification. It does not perform autonomous investigation or vulnerability checks. The current interface is a set of Python modules; there is no CLI or service entry point yet.
 
+## Mission 003: Offline researcher workflow
+
+`intelligence.research_workflow.build_researcher_brief(asset_id, session)`
+reviews only observations already stored for one asset. It performs no DNS or
+HTTP requests, does not call an LLM, and does not execute verification tasks.
+It returns bounded observation cards with stored provenance metadata and
+creates/reuses only unverified review hypotheses for valid
+`endpoint_inventory` records. Each candidate is linked to its supporting
+observation through `HypothesisSupportingObservation`.
+
+The generated access-policy review candidate explicitly treats the stored HTTP
+status and response metadata as context, not proof of a weakness. Confidence is
+unassessed and impact is undetermined. The brief recommends comparing the
+observation with documented program policy; any active verification requires a
+researcher to confirm scope and approve a separate verification plan. The
+workflow flushes but never commits, so the caller owns persistence. It omits
+target response headers, body content, raw DNS values, and unrecognized
+observation data from the brief.
+
+This is deliberately an offline-only researcher aid, not a reconnaissance
+orchestration engine. Live recon, automated vulnerability hypothesis generation
+and external model calls are outside this implementation scope.
+
 ## V2 Scope
 
 V2 adds investigation intelligence on top of V1: it summarizes the observations already stored for one asset, asks a model for candidate hypotheses through the first live `intelligence.llm_client` caller, and ranks those candidates with a deterministic rule. It produces **unverified candidates only**. No V2 module probes the network, runs a tool, changes a hypothesis status, or commits the caller's transaction; a human still has to invoke a verification flow before anything becomes evidence.

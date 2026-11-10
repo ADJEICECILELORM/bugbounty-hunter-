@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, event
+from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, UniqueConstraint, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -165,6 +165,9 @@ class Hypothesis(Base):
     finding: Mapped[Finding | None] = relationship(
         back_populates="hypothesis", cascade="all, delete-orphan", uselist=False
     )
+    supporting_observations: Mapped[list[HypothesisSupportingObservation]] = relationship(
+        back_populates="hypothesis"
+    )
 
 
 class Observation(Base):
@@ -183,6 +186,12 @@ class Observation(Base):
 
     asset: Mapped[Asset] = relationship(back_populates="observations")
     hypothesis: Mapped[Hypothesis | None] = relationship(back_populates="observations")
+    supporting_hypotheses: Mapped[list[HypothesisSupportingObservation]] = relationship(
+        back_populates="observation"
+    )
+    provenance: Mapped[ObservationProvenance | None] = relationship(
+        back_populates="observation", uselist=False
+    )
 
 
 class Verdict(Base):
@@ -259,4 +268,71 @@ class PromotionAudit(Base):
     verdict_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class HypothesisSupportingObservation(Base):
+    """Record the observations included in a hypothesis's generation context.
+
+    These links capture which observations were summarized and passed to the
+    model when a hypothesis was generated. They are context, never proof: a
+    hypothesis citing N observations is still a hypothesis, and these links are
+    never accepted as verification evidence.
+
+    The relationship has no delete cascade, so deleting a hypothesis or an
+    observation cannot silently erase the historical fact that a citation
+    existed. Database foreign keys prevent dangling references; startup
+    integrity validation reports any violations already present in a database.
+    """
+
+    __tablename__ = "hypothesis_supporting_observations"
+    __table_args__ = (UniqueConstraint("hypothesis_id", "observation_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("hypotheses.id"), nullable=False
+    )
+    observation_id: Mapped[int] = mapped_column(
+        ForeignKey("observations.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    hypothesis: Mapped[Hypothesis] = relationship(
+        back_populates="supporting_observations"
+    )
+    observation: Mapped[Observation] = relationship(
+        back_populates="supporting_hypotheses"
+    )
+
+
+class ObservationProvenance(Base):
+    """Where an observation came from and under what authorization it was collected.
+
+    A sidecar that deliberately leaves ``Observation.data`` untouched so the
+    evidence digest and the summary allowlist stay unchanged. ``created_at`` on
+    the observation row is database insertion time; ``captured_at`` here is the
+    original capture time, or ``None`` when unknown (for example a future
+    external import). ``authorization_snapshot`` preserves the effective scope
+    lists and target that the ``authorize`` gate consulted at collection time,
+    so a later change to ``Program.authorized_scope`` cannot rewrite history.
+    """
+
+    __tablename__ = "observation_provenance"
+
+    observation_id: Mapped[int] = mapped_column(
+        ForeignKey("observations.id"), primary_key=True
+    )
+    collector: Mapped[str] = mapped_column(String(64), nullable=False)
+    collector_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    external_evidence_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    authorization_program_id: Mapped[int | None] = mapped_column(
+        ForeignKey("programs.id"), nullable=True
+    )
+    authorization_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    observation: Mapped[Observation] = relationship(
+        back_populates="provenance"
     )
