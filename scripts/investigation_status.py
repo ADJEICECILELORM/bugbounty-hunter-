@@ -14,6 +14,7 @@ Usage:
     venv/bin/python scripts/investigation_status.py
     venv/bin/python scripts/investigation_status.py --investigation 1
     venv/bin/python scripts/investigation_status.py --investigation 1 --threshold-seconds 600
+    venv/bin/python scripts/investigation_status.py --investigation 1 --researcher-dashboard
 """
 
 from __future__ import annotations
@@ -34,10 +35,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from orchestration.status_board import (  # noqa: E402
     DEFAULT_STUCK_THRESHOLD_SECONDS,
+    IntelligenceDashboard,
     InvestigationStatus,
     InvestigationSummary,
     TaskSummary,
     get_investigation_status,
+    get_researcher_dashboard,
     list_investigations,
 )
 
@@ -106,6 +109,97 @@ def _print_board(board: InvestigationStatus, threshold_seconds: float) -> None:
         _print_task(task)
 
 
+def _print_researcher_dashboard(board: IntelligenceDashboard) -> None:
+    """Render the stored intelligence view without triggering workflow actions."""
+    def count(value: int | None) -> str:
+        return str(value) if value is not None else "unavailable"
+
+    print(f"Researcher dashboard for investigation #{board.investigation_id}:")
+    print(f"  status: {board.status or 'unavailable'}")
+    print(
+        f"  assets={count(board.assets)} observations={count(board.observations)} "
+        f"hypotheses={count(board.hypotheses)} findings={count(board.findings)}"
+    )
+    print("  data availability:")
+    for name, value in board.data_availability.items():
+        print(f"    {name}: {value}")
+
+    if board.assets == 0:
+        print("  assets: none stored")
+    elif board.assets is None:
+        print("  assets: unavailable; asset records could not be inspected")
+    asset_hostnames = board.asset_hostnames or {}
+    observation_groups = board.observation_groups or {}
+    hypotheses_by_asset = board.hypotheses_by_asset or {}
+    for asset_id, hostname in asset_hostnames.items():
+        print(f"  asset #{asset_id} {hostname}:")
+        if board.observation_groups is None:
+            print("    observations: unavailable in this database schema")
+            continue
+        observations = observation_groups.get(asset_id, [])
+        if not observations:
+            print("    observations: none stored for this asset")
+        for observation in observations:
+            collector = observation.provenance_collector or "unknown"
+            captured = _format_timestamp(observation.captured_at)
+            print(
+                f"    observation #{observation.observation_id} "
+                f"type={observation.observation_type} "
+                f"recorded={_format_timestamp(observation.created_at)} "
+                f"collector={collector} captured={captured}"
+            )
+            print(f"      {observation.summary}")
+            print(f"      evidence: {observation.evidence_interpretation}")
+
+    if board.hypotheses_by_asset is None:
+        print("  hypotheses: unavailable in this database schema")
+    elif board.hypotheses == 0:
+        print("  hypotheses: none stored")
+    for asset_id, hostname in asset_hostnames.items():
+        print(f"  research hypotheses for asset #{asset_id} {hostname}:")
+        if board.hypotheses_by_asset is None:
+            print("    hypotheses: unavailable in this database schema")
+            continue
+        hypotheses = hypotheses_by_asset.get(asset_id, [])
+        if not hypotheses:
+            print("    hypotheses: none stored for this asset")
+        for hypothesis in hypotheses:
+            print(
+                f"    hypothesis #{hypothesis.hypothesis_id} "
+                f"category={hypothesis.category} status={hypothesis.status}"
+            )
+            print(f"      {hypothesis.description}")
+            print(f"      evidence: {hypothesis.evidence_interpretation}")
+            print(
+                f"      confidence={hypothesis.confidence or 'not recorded'} "
+                f"impact={hypothesis.impact or 'not recorded'} "
+                f"priority={hypothesis.priority or 'not recorded'}"
+            )
+            if hypothesis.priority_reason:
+                print(f"      priority basis: {hypothesis.priority_reason}")
+            if hypothesis.supporting_observation_ids:
+                ids = ", ".join(
+                    f"#{observation_id}"
+                    for observation_id in hypothesis.supporting_observation_ids
+                )
+                print(f"      supporting observation IDs (context only): {ids}")
+            elif hypothesis.supporting_observation_ids is None:
+                print("      supporting observation IDs: unavailable in this database schema")
+            else:
+                print("      supporting observation IDs: none available")
+            if hypothesis.unavailable_support_count:
+                print(
+                    "      warning: "
+                    f"{hypothesis.unavailable_support_count} linked record(s) "
+                    "are missing or belong to another asset"
+                )
+            print(f"      additional evidence: {hypothesis.additional_evidence}")
+            print(
+                "      recommendation (not a verified vulnerability): "
+                f"{hypothesis.recommended_next_step}"
+            )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Print an investigation status board, read-only."
@@ -123,6 +217,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="running tasks older than this many seconds count as stuck "
         f"(default: {DEFAULT_STUCK_THRESHOLD_SECONDS:g})",
     )
+    parser.add_argument(
+        "--researcher-dashboard",
+        action="store_true",
+        help="show stored observations and evidence-linked hypotheses "
+        "(requires --investigation; read-only)",
+    )
     return parser
 
 
@@ -132,10 +232,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--investigation must be a positive integer.")
     if args.threshold_seconds < 0:
         raise SystemExit("--threshold-seconds must be >= 0.")
+    if args.researcher_dashboard and args.investigation is None:
+        raise SystemExit("--researcher-dashboard requires --investigation.")
 
     engine = read_only_engine(DB_PATH)
     try:
         with Session(engine) as session:
+            if args.researcher_dashboard:
+                dashboard = get_researcher_dashboard(session, args.investigation)
+                _print_researcher_dashboard(dashboard)
+                return 0
             if args.investigation is None:
                 _print_investigations(list_investigations(session))
                 return 0

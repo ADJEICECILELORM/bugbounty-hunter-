@@ -27,6 +27,43 @@ This is deliberately an offline-only researcher aid, not a reconnaissance
 orchestration engine. Live recon, automated vulnerability hypothesis generation
 and external model calls are outside this implementation scope.
 
+### Mission 003B: Researcher intelligence dashboard
+
+The existing read-only operator status board can render a researcher view with
+`scripts/investigation_status.py --investigation <id> --researcher-dashboard`.
+It presents stored asset, observation, hypothesis, and finding counts; groups
+bounded observation summaries by asset ID (hostname is display metadata only);
+includes available provenance; and
+shows hypothesis status, support-observation IDs, missing or unavailable
+support, and next-step recommendations. Confidence and impact are displayed as
+unrecorded when the schema has no such fields. The existing deterministic
+unverified-hypothesis ordering is shown only as a review order, not a severity
+or confidence score.
+
+Stored observations are labeled as records rather than vulnerability verdicts.
+Hypotheses remain clearly identified as inferences unless a human-approved
+`Finding` row exists; even then the dashboard does not independently re-verify
+the finding. Support links record research context and are never treated as
+proof. Recommendations are evidence-linked review suggestions, not verification
+commands; active verification still requires confirmed authorization and
+explicit researcher approval.
+
+Dashboard generation and rendering only read existing database rows. Library
+queries run with SQLAlchemy autoflush disabled and use column projections, so
+caller-owned pending inserts, edits, and deletes are neither flushed nor
+overwritten. The dashboard does not commit, flush, roll back, or change pending
+session state. It does not invoke `build_researcher_brief()`, create hypotheses
+or support links, make network requests, call an LLM, or promote findings. The
+CLI opens the database with SQLite read-only mode.
+
+The dashboard checks required columns before querying every relevant table.
+Absent tables and incomplete tables are reported as unavailable; their
+corresponding grouped collections are `None` and counts are unavailable rather
+than zero. Zero and empty collections are reported only when the available
+schema was queried and no matching records were found. Optional
+provenance metadata and budget columns are reported as unavailable or partial
+when not present; the dashboard never migrates or creates tables.
+
 ## V2 Scope
 
 V2 adds investigation intelligence on top of V1: it summarizes the observations already stored for one asset, asks a model for candidate hypotheses through the first live `intelligence.llm_client` caller, and ranks those candidates with a deterministic rule. It produces **unverified candidates only**. No V2 module probes the network, runs a tool, changes a hypothesis status, or commits the caller's transaction; a human still has to invoke a verification flow before anything becomes evidence.
