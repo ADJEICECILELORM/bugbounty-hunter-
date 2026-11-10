@@ -65,7 +65,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.db import init_db  # noqa: E402
+from data.db import open_ready_database  # noqa: E402
 from scripts import lab_basket_access_experiment as lab  # noqa: E402
 from verification.run_hypothesis_verification import (  # noqa: E402
     HypothesisVerificationResult,
@@ -293,7 +293,7 @@ def main() -> int:
         headers_b=headers_b,
     )
 
-    engine = init_db(LAB_DB_URL)
+    engine = open_ready_database(LAB_DB_URL)
     try:
         with Session(engine) as session:
             hypothesis_id = lab._create_hypothesis(session)

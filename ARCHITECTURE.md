@@ -4,6 +4,102 @@
 
 V1 provides program configuration, scope enforcement, safe DNS resolution, passive DNS discovery, relational storage, and an explicit single-request HTTP probe for controlled verification. It does not perform autonomous investigation or vulnerability checks. The current interface is a set of Python modules; there is no CLI or service entry point yet.
 
+## Database schema migrations
+
+Database engine construction, fresh initialization, readiness validation,
+integrity checking, and migration are separate operations in `data.db`.
+Ordinary application startup calls `open_ready_database()`: it builds an
+engine, validates the existing schema without writing, and refuses startup
+with an actionable message if explicit migration is needed. It never migrates.
+
+`initialize_fresh_database()` is only for a genuinely empty database. It creates
+the current schema and migration history transactionally, and refuses any
+database containing existing tables, views, or other SQLite objects. The
+deprecated `init_db()` wrapper is fresh-only; it no longer migrates.
+
+An operator explicitly upgrades an existing SQLite database with:
+
+```sh
+python -m scripts.migrate_database --database /path/to/evidence.db \
+  --confirm-writers-stopped
+```
+
+The operator must stop every process that can write to the database and keep
+them stopped through migration and readiness validation. The required flag is
+a human acknowledgment; it does not detect or stop other processes. The command
+performs read-only, version-aware preflight checks, including schema constraints
+and existing orphaned rows, and refuses unsupported or incomplete schemas.
+Before migration it uses SQLite's online backup API (safe
+for WAL databases), writes a new backup without overwriting existing files,
+opens and integrity-checks that backup, and records its SHA-256 in a `.sha256`
+sidecar. It then applies the numbered migrations and validates the resulting
+schema and database integrity. A failed migration is not automatically
+restored: keep application writers stopped, retain the failed database and backup,
+inspect the reported failure, and verify the backup checksum and contents
+before an operator manually chooses a recovery action. Never overwrite the
+failed database automatically.
+
+The current schema version is 3:
+
+1. `investigation_budgets` adds nullable `max_tasks` and `max_llm_calls` columns
+   to `investigations` when they are absent.
+2. `task_verification_and_v81_tables` creates missing task, verification, audit,
+   hypothesis-support, and observation-provenance tables. Existing tables and
+   their records are left in place.
+3. `sqlite_historical_record_retention` adds SQLite `BEFORE DELETE` triggers to
+   retained evidence and audit tables.
+
+Migration history and each migration's DDL are committed together. A failed
+migration rolls back that step and can be retried; previously completed steps
+remain recorded. Re-running initialization is idempotent. Unsupported or
+incomplete unversioned schemas fail explicitly rather than being reset or
+silently treated as current.
+
+### Referential integrity and evidence retention
+
+SQLite foreign-key enforcement is enabled on each DBAPI connection created by
+`data.db.create_database_engine()` and by the read-only report/status tools,
+before a transaction begins. Fresh initialization and schema readiness run
+`check_database_integrity()` and fail
+if declared constraints are missing, have unsafe delete actions, enforcement
+is off, or existing foreign-key violations are detected; it does not repair or
+delete orphaned records.
+
+Parent relationships use restrictive foreign keys and do not cascade deletes.
+Deleting a program, investigation, asset, hypothesis, observation, task, or
+finding is rejected while referenced records remain, whether the delete is
+issued through the ORM or SQL. Existing SQLite databases use non-deferrable
+`NO ACTION` foreign keys, which also reject those deletes; fresh and newly
+created tables declare `RESTRICT`.
+
+Standalone `Observation`, `ObservationProvenance`,
+`HypothesisSupportingObservation`, `Verdict`, `Finding`, `TaskEvent`, and
+`PromotionAudit` records cannot be permanently deleted through normal ORM
+operations (including bulk deletes) or direct SQL. SQLAlchemy session guards
+reject ORM deletions, and SQLite `BEFORE DELETE` triggers using
+`RAISE(ABORT, ...)` provide the final database-level enforcement, including
+against deletes initiated by cascading operations. The integrity checker
+verifies that every required trigger exists and is a `BEFORE DELETE` trigger
+using `RAISE(ABORT, ...)`; it reports missing or altered triggers without
+recreating them.
+
+Investigation lifecycle transitions remain the supported way to close work;
+archival or status transitions are preferred to deleting evidence. SQLite
+retention triggers are implemented in schema migration version 3.
+
+SQLite migrations acquire an immediate write lock and use transactional DDL.
+PostgreSQL uses transaction-scoped advisory locking and SQLAlchemy-generated
+table DDL, but is experimental and has not been validated against a PostgreSQL
+server. SQLite is the supported migration and backup target. Future schema
+changes must add a new migration version rather than rewriting an already
+released migration.
+
+The referential-integrity behavior has been tested with SQLite only. SQLAlchemy
+ORM deletion guards apply when writes pass through the configured ORM session,
+but PostgreSQL direct-SQL retention triggers are not implemented. PostgreSQL
+migration locking and database-level delete behavior remain unverified against
+a PostgreSQL server.
+
 ## Mission 003: Offline researcher workflow
 
 `intelligence.research_workflow.build_researcher_brief(asset_id, session)`
@@ -118,7 +214,7 @@ Close policy: **strict block.** `close_investigation()` raises `OpenTasksError` 
 - `ended_at` — when it reached a terminal status, mirroring `Investigation.ended_at`.
 - `result_summary` — optional operator note on the outcome (up to 2000 characters); it is a note, never evidence, and nothing reads it as a verdict.
 
-The schema change is additive: `init_db()` creates the new `tasks` table and alters no existing table or column (verified on a `/tmp` copy of `lab_evidence_v3.db`).
+The schema change is additive: explicit migration version 2 creates missing task and verification tables. `init_db()` is deprecated and fresh-database-only; it refuses an existing database and does not migrate it.
 
 ### Operator runs own an investigation and its tasks
 
@@ -144,7 +240,7 @@ The V6 first slice is a **supervised cycle**, not an autonomous loop: one explic
 3. `gateway.resolver.authorized_resolve()` rejects out-of-scope hostnames before delegating to `gateway.dns_pin.pin_url()`. The pinning layer validates the URL, authorizes it again, resolves it, and rejects any non-public answer. The adapter returns one validated IP.
 4. `workers.recon.passive_discover()` calls the authorized resolver before querying A, AAAA, MX, and TXT records through dnspython. Each record query consumes one `RateLimiter` allowance; when the allowance is exhausted, recon stops and returns observations already collected. It performs DNS lookups only.
 5. `workers.storage.store_observations()` creates or reuses an asset within an investigation and adds observations to the caller's SQLAlchemy session. The caller owns commit and rollback.
-6. `data.models` defines Program, Investigation, Task, Asset, and Observation. `data.db.init_db()` creates the schema and returns an engine.
+6. `data.models` defines Program, Investigation, Task, Asset, and Observation. `data.db.initialize_fresh_database()` creates the schema only for an empty database; runtime entry points validate readiness and do not initialize or migrate.
 7. `verification.http_probe.probe_endpoint()` authorizes and pins a URL, sends one GET directly to the selected pinned IP, and returns status, sanitized/truncated headers, elapsed time, raw response-body byte count, and a SHA-256 hash of those bytes. The raw body is not retained; redirects are not followed; the request has an absolute deadline and a 1 MiB response limit.
 8. `verification.diff_check.compare_requests()` runs two independent authorized probes and reports only deterministic status, body-hash, content-length, and header differences. It does not interpret their security meaning; callers may pass distinct request headers, which are not included in the diff result.
 9. `verification.evidence.store_diff_evidence()` links an allowlisted diff result to a `Hypothesis` and its `Asset` via the hypothesis relationship. Hypotheses remain unverified by default; storing evidence does not classify a vulnerability.

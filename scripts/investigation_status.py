@@ -43,6 +43,7 @@ from orchestration.status_board import (  # noqa: E402
     get_researcher_dashboard,
     list_investigations,
 )
+from data.sqlite import enable_sqlite_foreign_keys  # noqa: E402
 
 DB_NAME = "lab_evidence_v3.db"
 DB_PATH = REPO_ROOT / DB_NAME
@@ -56,7 +57,7 @@ def read_only_engine(db_path: Path) -> Engine:
             "re-run this script; it only reads an existing database."
         )
     uri = f"sqlite:///file:{db_path.resolve().as_posix()}?mode=ro&uri=true"
-    return create_engine(uri)
+    return enable_sqlite_foreign_keys(create_engine(uri))
 
 
 def _format_timestamp(value: datetime | None) -> str:

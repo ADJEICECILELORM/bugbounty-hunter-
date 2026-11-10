@@ -285,8 +285,12 @@ def test_context_collection_refuses_a_missing_hypothesis(session: Session) -> No
         category="access_control",
         approved_by="Ada",
     )
+    connection = session.connection()
+    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
     session.add(orphan)
     session.flush()
+    session.commit()
+    session.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
 
     with pytest.raises(FindingReportContextError):
         collect_finding_context(session, orphan)

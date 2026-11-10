@@ -14,6 +14,7 @@ from data.db import init_db
 from data.models import (
     Asset,
     Finding,
+    HistoricalRecordIsImmutable,
     Hypothesis,
     Investigation,
     Observation,
@@ -266,16 +267,19 @@ def test_an_unknown_hypothesis_is_a_lookup_error(session: Session) -> None:
         promote_to_finding(999, session, approved_by="Ada Reviewer")
 
 
-def test_promotion_is_refused_when_the_evidence_row_is_gone(session: Session) -> None:
+def test_evidence_cannot_be_deleted_while_a_verdict_references_it(
+    session: Session,
+) -> None:
     hypothesis = seed_hypothesis(session)
     observation, *_ = seed_supported_evidence(session, hypothesis)
+    observation_id = observation.id
+    session.commit()
     session.delete(observation)
-    session.flush()
+    with pytest.raises(HistoricalRecordIsImmutable):
+        session.flush()
+    session.rollback()
 
-    with pytest.raises(PromotionRefused) as error:
-        promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
-
-    assert "does not exist" in str(error.value)
+    assert session.get(Observation, observation_id) is not None
     assert session.scalars(select(Finding)).all() == []
 
 

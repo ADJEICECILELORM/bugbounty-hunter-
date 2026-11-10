@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.db import init_db  # noqa: E402
+from data.db import open_ready_database  # noqa: E402
 from data.models import Investigation  # noqa: E402
 from verification.task_recovery import (  # noqa: E402
     create_retry_task,
@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--threshold-seconds must be >= 0")
 
     db_path = (REPO_ROOT / DB_NAME).resolve()
-    engine = init_db(f"sqlite+pysqlite:///{db_path.as_posix()}")
+    engine = open_ready_database(f"sqlite+pysqlite:///{db_path.as_posix()}")
 
     with Session(engine) as session:
         investigation = session.get(Investigation, args.investigation_id)

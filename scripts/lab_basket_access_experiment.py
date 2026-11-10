@@ -51,7 +51,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.db import init_db  # noqa: E402
+from data.db import open_ready_database  # noqa: E402
 from data.models import Asset, Hypothesis, Investigation, Program  # noqa: E402
 from verification.lab_verification import run_lab_verification  # noqa: E402
 from verification.run_verification import VerificationRunResult  # noqa: E402
@@ -360,7 +360,7 @@ def main() -> int:
     headers_a = {"Authorization": f"Bearer {token_a}"}
     headers_b = {"Authorization": f"Bearer {token_b}"}
 
-    engine = init_db(LAB_DB_URL)
+    engine = open_ready_database(LAB_DB_URL)
     try:
         with Session(engine) as session:
             hypothesis_id = _create_hypothesis(session)

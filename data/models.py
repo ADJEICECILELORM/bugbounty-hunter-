@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, UniqueConstraint, event
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -26,7 +26,7 @@ class Program(Base):
     )
 
     investigations: Mapped[list[Investigation]] = relationship(
-        back_populates="program", cascade="all, delete-orphan"
+        back_populates="program", passive_deletes="all"
     )
 
 
@@ -34,7 +34,9 @@ class Investigation(Base):
     __tablename__ = "investigations"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    program_id: Mapped[int] = mapped_column(ForeignKey("programs.id"), nullable=False)
+    program_id: Mapped[int] = mapped_column(
+        ForeignKey("programs.id", ondelete="RESTRICT"), nullable=False
+    )
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
@@ -44,19 +46,21 @@ class Investigation(Base):
     # Per-investigation budget overrides. ``None`` means "use the module default"
     # (see ``verification.investigation_tasks.MAX_TASKS_PER_INVESTIGATION`` and
     # ``MAX_LLM_CALLS_PER_INVESTIGATION``). Nullable with the default in code
-    # rather than the schema, so the already-populated ``lab_evidence_v3.db`` -
-    # which ``data.db.init_db`` never migrates - keeps opening without a back-fill.
+    # rather than the schema; explicit migration adds these columns to supported
+    # legacy databases without back-filling existing rows.
     max_tasks: Mapped[int | None] = mapped_column(nullable=True)
     max_llm_calls: Mapped[int | None] = mapped_column(nullable=True)
 
-    program: Mapped[Program] = relationship(back_populates="investigations")
+    program: Mapped[Program] = relationship(
+        back_populates="investigations", passive_deletes="all"
+    )
     assets: Mapped[list[Asset]] = relationship(
-        back_populates="investigation", cascade="all, delete-orphan"
+        back_populates="investigation", passive_deletes="all"
     )
     tasks: Mapped[list[Task]] = relationship(
         back_populates="investigation",
-        cascade="all, delete-orphan",
         order_by="Task.id",
+        passive_deletes="all",
     )
 
 
@@ -72,7 +76,7 @@ class Task(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     investigation_id: Mapped[int] = mapped_column(
-        ForeignKey("investigations.id"), nullable=False
+        ForeignKey("investigations.id", ondelete="RESTRICT"), nullable=False
     )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
@@ -86,9 +90,11 @@ class Task(Base):
     depends_on: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
-    investigation: Mapped[Investigation] = relationship(back_populates="tasks")
+    investigation: Mapped[Investigation] = relationship(
+        back_populates="tasks", passive_deletes="all"
+    )
     events: Mapped[list[TaskEvent]] = relationship(
-        back_populates="task", order_by="TaskEvent.id"
+        back_populates="task", order_by="TaskEvent.id", passive_deletes="all"
     )
 
 
@@ -102,14 +108,18 @@ class TaskEvent(Base):
     __tablename__ = "task_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=False)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
-    task: Mapped[Task] = relationship(back_populates="events")
+    task: Mapped[Task] = relationship(
+        back_populates="events", passive_deletes="all"
+    )
 
 
 class TaskEventIsAppendOnly(Exception):
@@ -127,19 +137,21 @@ class Asset(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     investigation_id: Mapped[int] = mapped_column(
-        ForeignKey("investigations.id"), nullable=False
+        ForeignKey("investigations.id", ondelete="RESTRICT"), nullable=False
     )
     hostname: Mapped[str] = mapped_column(String(253), nullable=False)
     discovered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
-    investigation: Mapped[Investigation] = relationship(back_populates="assets")
+    investigation: Mapped[Investigation] = relationship(
+        back_populates="assets", passive_deletes="all"
+    )
     observations: Mapped[list[Observation]] = relationship(
-        back_populates="asset", cascade="all, delete-orphan"
+        back_populates="asset", passive_deletes="all"
     )
     hypotheses: Mapped[list[Hypothesis]] = relationship(
-        back_populates="asset", cascade="all, delete-orphan"
+        back_populates="asset", passive_deletes="all"
     )
 
 
@@ -147,7 +159,9 @@ class Hypothesis(Base):
     __tablename__ = "hypotheses"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False
+    )
     category: Mapped[str] = mapped_column(String(64), nullable=False)
     description: Mapped[str] = mapped_column(String(1000), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="unverified", nullable=False)
@@ -157,16 +171,16 @@ class Hypothesis(Base):
 
     asset: Mapped[Asset] = relationship(back_populates="hypotheses")
     observations: Mapped[list[Observation]] = relationship(
-        back_populates="hypothesis", cascade="all, delete-orphan"
+        back_populates="hypothesis", passive_deletes="all"
     )
     verdicts: Mapped[list[Verdict]] = relationship(
-        back_populates="hypothesis", cascade="all, delete-orphan"
+        back_populates="hypothesis", passive_deletes="all"
     )
     finding: Mapped[Finding | None] = relationship(
-        back_populates="hypothesis", cascade="all, delete-orphan", uselist=False
+        back_populates="hypothesis", uselist=False, passive_deletes="all"
     )
     supporting_observations: Mapped[list[HypothesisSupportingObservation]] = relationship(
-        back_populates="hypothesis"
+        back_populates="hypothesis", passive_deletes="all"
     )
 
 
@@ -174,9 +188,11 @@ class Observation(Base):
     __tablename__ = "observations"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False
+    )
     hypothesis_id: Mapped[int | None] = mapped_column(
-        ForeignKey("hypotheses.id"), nullable=True
+        ForeignKey("hypotheses.id", ondelete="RESTRICT"), nullable=True
     )
     observation_type: Mapped[str] = mapped_column(String(64), nullable=False)
     data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -184,13 +200,17 @@ class Observation(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
-    asset: Mapped[Asset] = relationship(back_populates="observations")
-    hypothesis: Mapped[Hypothesis | None] = relationship(back_populates="observations")
+    asset: Mapped[Asset] = relationship(
+        back_populates="observations", passive_deletes="all"
+    )
+    hypothesis: Mapped[Hypothesis | None] = relationship(
+        back_populates="observations", passive_deletes="all"
+    )
     supporting_hypotheses: Mapped[list[HypothesisSupportingObservation]] = relationship(
-        back_populates="observation"
+        back_populates="observation", passive_deletes="all"
     )
     provenance: Mapped[ObservationProvenance | None] = relationship(
-        back_populates="observation", uselist=False
+        back_populates="observation", uselist=False, passive_deletes="all"
     )
 
 
@@ -213,10 +233,10 @@ class Verdict(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     hypothesis_id: Mapped[int] = mapped_column(
-        ForeignKey("hypotheses.id"), nullable=False
+        ForeignKey("hypotheses.id", ondelete="RESTRICT"), nullable=False
     )
     observation_id: Mapped[int] = mapped_column(
-        ForeignKey("observations.id"), nullable=False
+        ForeignKey("observations.id", ondelete="RESTRICT"), nullable=False
     )
     claim_type: Mapped[str] = mapped_column(String(64), nullable=False)
     is_control: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -227,8 +247,10 @@ class Verdict(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
-    hypothesis: Mapped[Hypothesis] = relationship(back_populates="verdicts")
-    observation: Mapped[Observation] = relationship()
+    hypothesis: Mapped[Hypothesis] = relationship(
+        back_populates="verdicts", passive_deletes="all"
+    )
+    observation: Mapped[Observation] = relationship(passive_deletes="all")
 
 
 class Finding(Base):
@@ -238,7 +260,7 @@ class Finding(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     hypothesis_id: Mapped[int] = mapped_column(
-        ForeignKey("hypotheses.id"), nullable=False, unique=True
+        ForeignKey("hypotheses.id", ondelete="RESTRICT"), nullable=False, unique=True
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     category: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -247,7 +269,9 @@ class Finding(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
-    hypothesis: Mapped[Hypothesis] = relationship(back_populates="finding")
+    hypothesis: Mapped[Hypothesis] = relationship(
+        back_populates="finding", passive_deletes="all"
+    )
 
 
 class PromotionAudit(Base):
@@ -259,10 +283,10 @@ class PromotionAudit(Base):
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     actor: Mapped[str] = mapped_column(String(255), nullable=False)
     hypothesis_id: Mapped[int] = mapped_column(
-        ForeignKey("hypotheses.id"), nullable=False
+        ForeignKey("hypotheses.id", ondelete="RESTRICT"), nullable=False
     )
     finding_id: Mapped[int | None] = mapped_column(
-        ForeignKey("findings.id"), nullable=True
+        ForeignKey("findings.id", ondelete="RESTRICT"), nullable=True
     )
     evidence_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False)
     verdict_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False)
@@ -290,20 +314,20 @@ class HypothesisSupportingObservation(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     hypothesis_id: Mapped[int] = mapped_column(
-        ForeignKey("hypotheses.id"), nullable=False
+        ForeignKey("hypotheses.id", ondelete="RESTRICT"), nullable=False
     )
     observation_id: Mapped[int] = mapped_column(
-        ForeignKey("observations.id"), nullable=False
+        ForeignKey("observations.id", ondelete="RESTRICT"), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
     hypothesis: Mapped[Hypothesis] = relationship(
-        back_populates="supporting_observations"
+        back_populates="supporting_observations", passive_deletes="all"
     )
     observation: Mapped[Observation] = relationship(
-        back_populates="supporting_hypotheses"
+        back_populates="supporting_hypotheses", passive_deletes="all"
     )
 
 
@@ -322,17 +346,64 @@ class ObservationProvenance(Base):
     __tablename__ = "observation_provenance"
 
     observation_id: Mapped[int] = mapped_column(
-        ForeignKey("observations.id"), primary_key=True
+        ForeignKey("observations.id", ondelete="RESTRICT"), primary_key=True
     )
     collector: Mapped[str] = mapped_column(String(64), nullable=False)
     collector_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     external_evidence_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     authorization_program_id: Mapped[int | None] = mapped_column(
-        ForeignKey("programs.id"), nullable=True
+        ForeignKey("programs.id", ondelete="RESTRICT"), nullable=True
     )
     authorization_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     observation: Mapped[Observation] = relationship(
-        back_populates="provenance"
+        back_populates="provenance", passive_deletes="all"
     )
+
+
+class HistoricalRecordIsImmutable(Exception):
+    """Raised when an ORM operation attempts to delete retained history."""
+
+
+_RETAINED_RECORD_TYPES = (
+    Observation,
+    ObservationProvenance,
+    HypothesisSupportingObservation,
+    Verdict,
+    Finding,
+    TaskEvent,
+    PromotionAudit,
+)
+_RETAINED_RECORD_TABLES = {
+    model.__tablename__ for model in _RETAINED_RECORD_TYPES
+}
+
+
+@event.listens_for(Session, "before_flush")
+def _refuse_historical_record_deletion(
+    session: Session, _flush_context: Any, _instances: Any
+) -> None:
+    for instance in session.deleted:
+        if isinstance(instance, TaskEvent):
+            raise TaskEventIsAppendOnly(
+                f"TaskEvent {instance.id} is append-only"
+            )
+        if isinstance(instance, _RETAINED_RECORD_TYPES):
+            raise HistoricalRecordIsImmutable(
+                f"{type(instance).__name__} records are retained and cannot be deleted"
+            )
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _refuse_bulk_historical_record_deletion(execute_state: Any) -> None:
+    if not execute_state.is_delete:
+        return
+
+    table = getattr(execute_state.statement, "table", None)
+    if table is not None and table.name in _RETAINED_RECORD_TABLES:
+        if table.name == TaskEvent.__tablename__:
+            raise TaskEventIsAppendOnly("TaskEvent records are append-only")
+        raise HistoricalRecordIsImmutable(
+            f"Records in {table.name!r} are retained and cannot be deleted"
+        )

@@ -227,8 +227,8 @@ def _stub_lab_transport(
         def Session() -> "_FakeClient":  # noqa: N802 - mirrors the requests API
             return _FakeClient()
 
-    def fake_init_db(*_args: object, **_kwargs: object) -> object:
-        events.append("init_db")
+    def fake_open_ready_database(*_args: object, **_kwargs: object) -> object:
+        events.append("open_ready_database")
         return object()
 
     def fake_run_lab_verification(*_args: object, **_kwargs: object) -> object:
@@ -240,7 +240,7 @@ def _stub_lab_transport(
     monkeypatch.setattr(experiment, "_login", lambda *_a, **_k: logins.pop(0))
     monkeypatch.setattr(experiment, "_add_basket_item", lambda *_a, **_k: None)
     monkeypatch.setattr(experiment, "_read_basket", lambda *_a, **_k: next(reads))
-    monkeypatch.setattr(experiment, "init_db", fake_init_db)
+    monkeypatch.setattr(experiment, "open_ready_database", fake_open_ready_database)
     monkeypatch.setattr(experiment, "run_lab_verification", fake_run_lab_verification)
     return events
 

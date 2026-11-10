@@ -1,5 +1,12 @@
 # V1 Build Plan — Agentic Bug Bounty Hunter
 
+## Project 001 — Milestone A migration safety remediation
+
+- ✅ Explicit migration preflight now validates versioned schema constraints and source foreign-key integrity before backup or migration; each migration's resulting schema is validated before its history row is recorded.
+- ✅ The migration CLI requires `--confirm-writers-stopped`. This is an operator acknowledgment for the maintenance window, not process detection. SQLite remains the supported migration/backup target; PostgreSQL remains experimental.
+- ✅ Added focused regression coverage for orphaned legacy records, malformed optional `findings` constraints, inconsistent migration history, and missing writer acknowledgment. `tests/test_db_migrations.py` and `tests/test_db_integrity.py` pass (61 tests); the full suite remains to be run.
+- ⚠️ Migration is not authorized merely by the flag. Operators must actually stop every database writer and follow the backup/recovery procedure in `ARCHITECTURE.md`.
+
 **V1 scope per the original roadmap:** Program configuration, authorization checks, passive asset discovery, structured storage. Nothing autonomous yet — just the safe foundation.
 
 ## Status so far
@@ -51,7 +58,7 @@
 - Full suite at this slice: `363 passed` (353 at `a26a0fe`; 10 new in `tests/test_investigation_lifecycle.py`).
 - ✅ `verification/investigation_tasks.py` + the `Task` model — the V4 orchestration foundation, committed as `4a4f704`. An investigation now owns tasks: `create_task` (running investigation only, `kind` from the fixed allowlist `recon`/`inventory`/`hypothesis_review`/`verification`/`report`, non-blank title, starts `pending`), `start_task` (`pending` → `running`, sets `started_at`), `complete_task` (`completed`/`failed` from `running`, `cancelled` from `pending` or `running`, sets `ended_at` and an optional `result_summary`), and read-only `list_tasks`. All writers flush and never commit, and none touches a hypothesis, finding, verdict, observation, or the network.
 - ✅ **Strict close policy.** `close_investigation()` now raises `OpenTasksError` while any task is pending or running and changes nothing; it never auto-cancels. A closed investigation therefore never has an open task.
-- ✅ **Additive schema change.** One new `tasks` table (9 columns, each justified in `ARCHITECTURE.md`) plus the `Investigation.tasks` relationship; no existing table or column changed, verified by running `init_db()` on a `/tmp` copy of `lab_evidence_v3.db`.
+- ✅ **Additive schema change.** One new `tasks` table (9 columns, each justified in `ARCHITECTURE.md`) plus the `Investigation.tasks` relationship; no existing table or column changed. Existing databases are upgraded only through the explicit, backed-up migration workflow described above.
 - ⚠️ **Human-triggered only — no autonomous scheduling yet.** A task is a record, not a job. There is no scheduler, dispatcher, planner, supervisor loop, HTN/DAG engine, or message bus, and nothing links a task to the module that would perform it; the operator runs that module themselves and records the outcome.
 - Full suite at this slice: `402 passed` (363 before; 39 new in `tests/test_investigation_tasks.py`).
 

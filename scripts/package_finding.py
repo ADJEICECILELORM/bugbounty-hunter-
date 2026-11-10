@@ -30,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from data.sqlite import enable_sqlite_foreign_keys  # noqa: E402
 from data.models import Finding  # noqa: E402
 from verification.finding_report import FindingReportContextError  # noqa: E402
 from verification.report_package import build_report_package  # noqa: E402
@@ -46,7 +47,7 @@ def read_only_engine(db_path: Path) -> Engine:
             "this script; it only reads an existing record, it never creates one."
         )
     uri = f"sqlite:///file:{db_path.resolve().as_posix()}?mode=ro&uri=true"
-    return create_engine(uri)
+    return enable_sqlite_foreign_keys(create_engine(uri))
 
 
 def _build_parser() -> argparse.ArgumentParser:

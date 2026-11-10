@@ -45,6 +45,7 @@ import sys
 from pathlib import Path
 
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +53,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.models import Finding  # noqa: E402
+from data.sqlite import enable_sqlite_foreign_keys  # noqa: E402
 from verification.finding_report import (  # noqa: E402
     FindingReportContextError,
     collect_finding_context,
@@ -69,7 +71,7 @@ _EXPECTED_DB_MISSING_MSG = (
 )
 
 
-def read_only_engine(db_path: Path) -> "create_engine":
+def read_only_engine(db_path: Path) -> Engine:
     """Open ``db_path`` read-only, refusing to run if the file is absent.
 
     ``mode=ro`` is enforced by SQLite itself: any write - including the schema
@@ -79,7 +81,7 @@ def read_only_engine(db_path: Path) -> "create_engine":
     if not db_path.is_file():
         raise SystemExit(_EXPECTED_DB_MISSING_MSG)
     uri = f"sqlite:///file:{db_path.resolve().as_posix()}?mode=ro&uri=true"
-    return create_engine(uri)
+    return enable_sqlite_foreign_keys(create_engine(uri))
 
 
 def _sha256(path: Path) -> str:
