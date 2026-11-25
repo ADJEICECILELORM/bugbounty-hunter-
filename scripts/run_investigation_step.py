@@ -40,11 +40,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.db import open_ready_database  # noqa: E402
+from scripts.database_options import (  # noqa: E402
+    OperatorDatabaseError,
+    add_database_option,
+    open_operator_database,
+)
 from data.models import Investigation  # noqa: E402
 from gateway.scope_policy import ScopePolicy  # noqa: E402
 from orchestration.supervisor import plan_next_tasks  # noqa: E402
 from orchestration.task_runner import run_task  # noqa: E402
+from verification.plan_input import VerificationPlanInputError, read_verification_plan  # noqa: E402
 
 DB_NAME = "lab_evidence_v3.db"
 
@@ -74,20 +79,50 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow private-network (lab) targets for this run only",
     )
+    parser.add_argument(
+        "--approve-verification",
+        action="store_true",
+        help="explicitly approve network verification tasks in this invocation",
+    )
+    parser.add_argument(
+        "--verification-plan-stdin",
+        action="store_true",
+        help="read the transient JSON verification plan from stdin (never persisted)",
+    )
+    add_database_option(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.approve_verification != args.verification_plan_stdin:
+        parser.error(
+            "--approve-verification and --verification-plan-stdin must be supplied together"
+        )
+    if args.approve_verification and not args.yes:
+        parser.error("verification approval requires --yes to execute")
+    if args.approve_verification and not args.lab:
+        parser.error("verification approval requires --lab for the lab-only verifier")
+    verification_plan = None
+    if args.verification_plan_stdin:
+        try:
+            verification_plan = read_verification_plan(sys.stdin)
+        except VerificationPlanInputError as error:
+            parser.error(str(error))
 
-    db_path = (REPO_ROOT / DB_NAME).resolve()
-    engine = open_ready_database(f"sqlite+pysqlite:///{db_path.as_posix()}")
+    try:
+        engine, db_path = open_operator_database(
+            args.database, default_path=REPO_ROOT / DB_NAME
+        )
+    except OperatorDatabaseError as error:
+        raise SystemExit(str(error)) from error
 
     with Session(engine) as session:
         investigation = session.get(Investigation, args.investigation_id)
         if investigation is None:
             raise SystemExit(
-                f"No Investigation #{args.investigation_id} exists in {DB_NAME}."
+                f"No Investigation #{args.investigation_id} exists in {db_path}."
             )
 
         proposed = plan_next_tasks(args.investigation_id, session)
@@ -95,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(proposed)} task(s) ready for investigation "
             f"{args.investigation_id}:"
         )
+        had_failures = False
         for task in proposed:
             print(f"  #{task.id} {task.kind}: {task.title}")
 
@@ -110,15 +146,25 @@ def main(argv: list[str] | None = None) -> int:
                     session,
                     authorize=authorize,
                     allow_private_network=args.lab,
+                    verification_plan=verification_plan,
+                    approve_verification=args.approve_verification,
+                    commit_before_dispatch=True,
                 )
                 print(f"  #{task.id} {task.kind}: completed")
             except Exception as error:  # noqa: BLE001 - report, then continue once
+                had_failures = True
                 print(f"  #{task.id} {task.kind}: {type(error).__name__}: {error}")
+            if task.kind == "verification":
+                print("Stopped after one verification task.")
+                break
 
         session.commit()
-        print("Done (one pass; no re-dispatch).")
+        if had_failures:
+            print("Finished one pass with task failures or refusals.")
+        else:
+            print("Done (one pass; no re-dispatch).")
 
-    return 0
+    return 1 if had_failures else 0
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from data.models import Asset, Hypothesis, Investigation, Task, TaskEvent
@@ -63,6 +63,7 @@ TASK_KINDS = frozenset(
     {
         "recon",
         "inventory",
+        "research_brief",
         "hypothesis_generation",
         "hypothesis_review",
         "verification",
@@ -76,6 +77,7 @@ TASK_KINDS = frozenset(
 # kind may carry a ``hypothesis_id``.
 TASK_PARAMS: Mapping[str, frozenset[str]] = {
     "inventory": frozenset({"asset_id", "base_url"}),
+    "research_brief": frozenset({"asset_id"}),
     "hypothesis_generation": frozenset({"asset_id"}),
     "verification": frozenset({"hypothesis_id"}),
 }
@@ -112,6 +114,7 @@ def create_task(
     title: str,
     params: Mapping[str, Any] | None = None,
     depends_on: list[int] | None = None,
+    dedupe_key: str | None = None,
 ) -> Task:
     """Add a ``pending`` task to a running investigation and flush it.
 
@@ -130,6 +133,10 @@ def create_task(
         raise ValueError(f"kind must be one of {sorted(TASK_KINDS)!r}, got {kind!r}")
     if not title.strip():
         raise ValueError("title must not be blank")
+    if dedupe_key is not None and (
+        not isinstance(dedupe_key, str) or not dedupe_key or len(dedupe_key) > 255
+    ):
+        raise ValueError("dedupe_key must be a non-empty string of at most 255 characters")
 
     investigation = session.get(Investigation, investigation_id)
     if investigation is None:
@@ -176,17 +183,19 @@ def create_task(
     checked_params = _checked_params(kind, dict(params or {}), investigation_id, session)
     checked_depends_on = _checked_depends_on(list(depends_on or []), investigation_id, session)
 
-    task = Task(
-        investigation_id=investigation_id,
-        kind=kind,
-        title=title,
-        status=PENDING,
-        params=checked_params,
-        depends_on=checked_depends_on,
-    )
-    session.add(task)
-    session.flush()
-    _append(task, "created", {"kind": kind, "depends_on": checked_depends_on}, session)
+    with session.begin_nested():
+        task = Task(
+            investigation_id=investigation_id,
+            kind=kind,
+            title=title,
+            status=PENDING,
+            params=checked_params,
+            depends_on=checked_depends_on,
+            dedupe_key=dedupe_key,
+        )
+        session.add(task)
+        session.flush()
+        _append(task, "created", {"kind": kind, "depends_on": checked_depends_on}, session)
     return task
 
 
@@ -199,11 +208,25 @@ def start_task(task_id: int, session: Session) -> Task:
     task = _get_task(task_id, session)
     if task.status != PENDING:
         raise ValueError(f"Task {task_id} is {task.status!r}, not {PENDING!r}")
-
-    task.status = RUNNING
-    task.started_at = datetime.now(UTC)
-    session.flush()
-    _append(task, "started", {}, session)
+    now = datetime.now(UTC)
+    try:
+        with session.begin_nested():
+            result = session.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status == PENDING)
+                .values(status=RUNNING, started_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                session.refresh(task)
+                raise ValueError(
+                    f"Task {task_id} is {task.status!r}, not {PENDING!r}"
+                )
+            session.refresh(task)
+            _append(task, "started", {}, session)
+    except BaseException:
+        session.refresh(task)
+        raise
     return task
 
 
@@ -234,11 +257,29 @@ def complete_task(
             f"Task {task_id} is {task.status!r} and cannot become {final_status!r}"
         )
 
-    task.status = final_status
-    task.ended_at = datetime.now(UTC)
-    task.result_summary = result_summary
-    session.flush()
-    _append(task, final_status, {"result_summary": result_summary}, session)
+    now = datetime.now(UTC)
+    try:
+        with session.begin_nested():
+            result = session.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status.in_(allowed_from))
+                .values(
+                    status=final_status,
+                    ended_at=now,
+                    result_summary=result_summary,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                session.refresh(task)
+                raise ValueError(
+                    f"Task {task_id} is {task.status!r} and cannot become {final_status!r}"
+                )
+            session.refresh(task)
+            _append(task, final_status, {"result_summary": result_summary}, session)
+    except BaseException:
+        session.refresh(task)
+        raise
     return task
 
 

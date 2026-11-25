@@ -44,6 +44,11 @@ from sqlalchemy.orm import Session
 
 from data.models import Investigation, Task
 from gateway.dns_pin import URLAuthorizer
+from orchestration.inventory_planner import (
+    InventoryTaskProposal,
+    plan_inventory_research_tasks,
+    preview_inventory_research_tasks,
+)
 from orchestration.supervisor import plan_next_tasks
 from orchestration.task_runner import run_task
 from verification.investigation_lifecycle import RUNNING
@@ -90,6 +95,7 @@ class CycleReport:
 
     investigation_id: int
     proposed: list[ProposedTask] = field(default_factory=list)
+    planned_inventory_tasks: list[InventoryTaskProposal] = field(default_factory=list)
     executed: list[TaskResult] = field(default_factory=list)
     skipped: list[Skipped] = field(default_factory=list)
 
@@ -103,6 +109,8 @@ def run_supervised_cycle(
     authorize: URLAuthorizer | None = None,
     allow_private_network: bool = False,
     verification_plan: VerificationTestPlan | None = None,
+    approve_verification: bool = False,
+    commit_task_start: bool = False,
 ) -> CycleReport:
     """Propose one investigation's ready tasks, and with ``execute`` run them once.
 
@@ -120,20 +128,33 @@ def run_supervised_cycle(
     straight through to ``run_task`` and never stored; a task that needs one and
     does not get it is refused by ``run_task`` and reported as a failed result,
     exactly like any other refusal. Raises :class:`LookupError` for a missing
-    investigation. Flushes only; never commits, and never writes
-    ``Hypothesis.status``.
+    investigation. Flushes only and never commits unless the explicit
+    ``commit_task_start`` option is enabled; that option checkpoints each
+    running-task status before its dispatch. Never writes ``Hypothesis.status``.
     """
-    investigation = session.get(Investigation, investigation_id)
+    with session.no_autoflush:
+        investigation = session.get(Investigation, investigation_id)
     if investigation is None:
         raise LookupError(f"Investigation {investigation_id} does not exist")
 
-    proposed = [
-        ProposedTask(task_id=task.id, kind=task.kind, title=task.title)
-        for task in plan_next_tasks(investigation_id, session)
-    ]
-
     if not execute:
-        return CycleReport(investigation_id=investigation_id, proposed=proposed)
+        with session.no_autoflush:
+            proposed = [
+                ProposedTask(task_id=task.id, kind=task.kind, title=task.title)
+                for task in plan_next_tasks(investigation_id, session)
+            ]
+            inventory_preview = preview_inventory_research_tasks(
+                investigation_id, session
+            )
+        skipped = []
+        if inventory_preview.budget_detail:
+            skipped.append(Skipped(reason="budget", detail=inventory_preview.budget_detail))
+        return CycleReport(
+            investigation_id=investigation_id,
+            proposed=proposed,
+            planned_inventory_tasks=list(inventory_preview.proposed_tasks),
+            skipped=skipped,
+        )
 
     if investigation.status != RUNNING:
         raise ValueError(
@@ -141,6 +162,13 @@ def run_supervised_cycle(
             f"not {RUNNING!r}"
         )
 
+    # Existing ready work is still useful to report when a stuck task blocks
+    # execution. Do not create inventory tasks until recovery is complete.
+    with session.no_autoflush:
+        proposed = [
+            ProposedTask(task_id=task.id, kind=task.kind, title=task.title)
+            for task in plan_next_tasks(investigation_id, session)
+        ]
     stuck = find_stuck_tasks(
         investigation_id, session, running_longer_than_seconds=threshold_seconds
     )
@@ -161,20 +189,56 @@ def run_supervised_cycle(
             ],
         )
 
+    inventory_plan = plan_inventory_research_tasks(investigation_id, session)
+    proposed = [
+        ProposedTask(task_id=task.id, kind=task.kind, title=task.title)
+        for task in plan_next_tasks(investigation_id, session)
+    ]
+
     executed: list[TaskResult] = []
+    skipped: list[Skipped] = []
     for task in proposed:
+        if task.kind == "verification":
+            if verification_plan is None:
+                reason = "verification_plan_required"
+            elif getattr(verification_plan, "hypothesis_id", None) != _task_hypothesis_id(
+                task.task_id, session
+            ):
+                reason = "verification_plan_mismatch"
+            elif not approve_verification:
+                reason = "verification_approval_required"
+            else:
+                reason = ""
+            if reason:
+                skipped.append(
+                    Skipped(
+                        reason=reason,
+                        detail=(
+                            f"Task #{task.task_id} remains pending; provide a transient "
+                            "verification plan bound to its hypothesis and explicit approval"
+                        ),
+                    )
+                )
+                break
         result = _run_one(
             task,
             session,
             authorize=authorize,
             allow_private_network=allow_private_network,
             verification_plan=verification_plan,
+            approve_verification=approve_verification,
+            commit_task_start=commit_task_start,
         )
         executed.append(result)
+        if task.kind == "verification":
+            # One operator-supplied plan and approval can authorize at most one
+            # target hypothesis in this cycle.
+            break
         if not result.ok:
             break
 
-    skipped: list[Skipped] = []
+    if inventory_plan.budget_detail:
+        skipped.append(Skipped(reason="budget", detail=inventory_plan.budget_detail))
     if not proposed:
         skipped.append(
             Skipped(reason="empty", detail="no ready tasks were proposed")
@@ -183,6 +247,7 @@ def run_supervised_cycle(
     return CycleReport(
         investigation_id=investigation_id,
         proposed=proposed,
+        planned_inventory_tasks=[],
         executed=executed,
         skipped=skipped,
     )
@@ -195,6 +260,8 @@ def _run_one(
     authorize: URLAuthorizer | None,
     allow_private_network: bool,
     verification_plan: VerificationTestPlan | None,
+    approve_verification: bool,
+    commit_task_start: bool,
 ) -> TaskResult:
     """Run one proposed task via ``run_task`` and record its outcome. Flush only."""
     task = session.get(Task, proposed.task_id)
@@ -216,6 +283,8 @@ def _run_one(
             authorize=authorize,
             allow_private_network=allow_private_network,
             verification_plan=verification_plan,
+            approve_verification=approve_verification,
+            commit_before_dispatch=commit_task_start,
         )
     except Exception as error:  # noqa: BLE001 - record, then stop on first failure
         message = f"{type(error).__name__}: {error}"[:ERROR_DETAIL_LIMIT]
@@ -236,3 +305,11 @@ def _run_one(
         ok=True,
         status=task.status,
     )
+
+
+def _task_hypothesis_id(task_id: int, session: Session) -> int | None:
+    task = session.get(Task, task_id)
+    if task is None or not isinstance(task.params, dict):
+        return None
+    hypothesis_id = task.params.get("hypothesis_id")
+    return hypothesis_id if type(hypothesis_id) is int else None

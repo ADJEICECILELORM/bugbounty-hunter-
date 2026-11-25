@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from data.db import init_db
@@ -301,8 +301,15 @@ def test_context_collection_refuses_a_verdict_that_was_edited(
 ) -> None:
     finding = promote_part_one_finding(session)
     verdict = session.scalars(select(Verdict).order_by(Verdict.id)).first()
-    verdict.rationale = "edited after promotion"
-    session.flush()
+    # Simulate a database-level edit that bypassed the immutability trigger so the
+    # report's consumption gate is exercised as defense in depth.
+    connection = session.connection()
+    connection.exec_driver_sql("DROP TRIGGER immutable_verdicts")
+    connection.execute(
+        text("UPDATE verdicts SET rationale = :rationale WHERE id = :id"),
+        {"rationale": "edited after promotion", "id": verdict.id},
+    )
+    session.expire_all()
 
     with pytest.raises(FindingReportContextError) as error:
         collect_finding_context(session, finding)
@@ -313,8 +320,13 @@ def test_context_collection_refuses_a_verdict_that_was_edited(
 def test_context_collection_refuses_a_verdict_with_no_digest(session: Session) -> None:
     finding = promote_part_one_finding(session)
     verdict = session.scalars(select(Verdict).order_by(Verdict.id)).first()
-    verdict.integrity_digest = ""
-    session.flush()
+    connection = session.connection()
+    connection.exec_driver_sql("DROP TRIGGER immutable_verdicts")
+    connection.execute(
+        text("UPDATE verdicts SET integrity_digest = '' WHERE id = :id"),
+        {"id": verdict.id},
+    )
+    session.expire_all()
 
     with pytest.raises(FindingReportContextError) as error:
         collect_finding_context(session, finding)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
 import hashlib
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from data import migrations
@@ -23,6 +23,12 @@ from data.db import (
     require_schema_ready,
 )
 from data.migrations import (
+    SQLITE_IMMUTABILITY_TRIGGERS,
+    SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS,
+    SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS,
+    SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+    SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+    SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
     MigrationError,
     initialize_fresh_schema,
     migrate_database,
@@ -35,12 +41,12 @@ from data.models import (
     HypothesisSupportingObservation,
     Investigation,
     Observation,
+    ObservationFingerprint,
     ObservationProvenance,
     Program,
+    Task,
+    TaskObservation,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
 
 def _create_legacy_test_database(path: Path) -> None:
     engine = create_engine(f"sqlite+pysqlite:///{path}")
@@ -62,6 +68,86 @@ def _create_legacy_test_database(path: Path) -> None:
             )
             connection.exec_driver_sql(
                 'ALTER TABLE "investigations" DROP COLUMN "max_llm_calls"'
+            )
+            connection.exec_driver_sql(
+                'ALTER TABLE "programs" DROP COLUMN "required_request_headers"'
+            )
+    finally:
+        engine.dispose()
+
+
+def _create_synthetic_versioned_database(path: Path, version: int) -> None:
+    if version == 0:
+        _create_legacy_test_database(path)
+        with sqlite3.connect(path) as database:
+            database.execute(
+                "INSERT INTO programs "
+                "(id, name, authorized_scope, excluded_scope, rate_limit, created_at) "
+                "VALUES (1, 'Synthetic legacy', '[\"example.test\"]', '[]', 1, "
+                "'2026-01-01 00:00:00')"
+            )
+            database.execute(
+                "INSERT INTO investigations "
+                "(id, program_id, status, started_at, ended_at) "
+                "VALUES (1, 1, 'running', '2026-01-01 00:00:00', NULL)"
+            )
+            database.execute(
+                "INSERT INTO assets (id, investigation_id, hostname, discovered_at) "
+                "VALUES (1, 1, 'example.test', '2026-01-01 00:00:00')"
+            )
+            database.execute(
+                "INSERT INTO observations "
+                "(id, asset_id, hypothesis_id, observation_type, data, created_at) "
+                "VALUES (1, 1, NULL, 'endpoint_inventory', "
+                "'{\"url\":\"https://example.test/\",\"status_code\":200}', "
+                "'2026-01-01 00:00:00')"
+            )
+        return
+
+    if version not in {4, 5}:
+        raise ValueError(f"Unsupported synthetic source version: {version}")
+
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    try:
+        initialize_fresh_database(engine)
+        with Session(engine) as session:
+            program = Program(
+                name=f"Synthetic v{version}",
+                authorized_scope=["example.test"],
+                excluded_scope=[],
+                rate_limit=1,
+            )
+            investigation = Investigation(program=program, status="running")
+            asset = Asset(investigation=investigation, hostname="example.test")
+            observation = Observation(
+                asset=asset,
+                observation_type="endpoint_inventory",
+                data={"url": "https://example.test/", "status_code": 200},
+            )
+            session.add(observation)
+            session.commit()
+
+        with engine.begin() as connection:
+            if version == 4:
+                for trigger_name in SQLITE_IMMUTABILITY_TRIGGERS:
+                    connection.exec_driver_sql(
+                        f'DROP TRIGGER "{trigger_name}"'
+                    )
+                connection.exec_driver_sql(
+                    "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8)"
+                )
+            for trigger_name in (
+                *SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+                *SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+                *SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+            ):
+                connection.exec_driver_sql(
+                    f'DROP TRIGGER IF EXISTS "{trigger_name}"'
+                )
+            connection.exec_driver_sql("DROP TABLE observation_fingerprints")
+            connection.exec_driver_sql("DROP TABLE task_observations")
+            connection.exec_driver_sql(
+                "DELETE FROM schema_migrations WHERE version IN (6, 7, 8)"
             )
     finally:
         engine.dispose()
@@ -117,6 +203,143 @@ def test_fresh_database_is_initialized_at_the_current_schema() -> None:
         engine.dispose()
 
 
+def test_task_observation_sql_mutations_are_rejected(tmp_path: Path) -> None:
+    engine = create_database_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'task-observation-protections.db'}"
+    )
+    initialize_fresh_database(engine)
+    with Session(engine) as session:
+        program = Program(
+            name="Synthetic",
+            authorized_scope=["example.test"],
+            excluded_scope=[],
+            rate_limit=1,
+        )
+        investigation = Investigation(program=program, status="running")
+        asset = Asset(investigation=investigation, hostname="example.test")
+        task = Task(
+            investigation=investigation,
+            kind="inventory",
+            status="completed",
+            title="synthetic inventory",
+        )
+        observation = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"url": "https://example.test/"},
+        )
+        session.add_all([task, observation])
+        session.flush()
+        link = TaskObservation(
+            task_id=task.id,
+            observation_id=observation.id,
+            role="output",
+        )
+        session.add(link)
+        session.commit()
+        link_id = link.id
+
+    with engine.begin() as connection:
+        with pytest.raises(IntegrityError, match="historical record immutability"):
+            connection.execute(
+                text("UPDATE task_observations SET role='input' WHERE id=:id"),
+                {"id": link_id},
+            )
+    with engine.begin() as connection:
+        with pytest.raises(IntegrityError, match="historical record retention"):
+            connection.execute(
+                text("DELETE FROM task_observations WHERE id=:id"),
+                {"id": link_id},
+            )
+
+    assert require_schema_ready(engine) == migrations.LATEST_SCHEMA_VERSION
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT role FROM task_observations WHERE id=:id"),
+            {"id": link_id},
+        ) == "output"
+    engine.dispose()
+
+
+def test_task_observation_ownership_is_enforced_by_sqlite(tmp_path: Path) -> None:
+    engine = create_database_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'task-observation-ownership.db'}"
+    )
+    initialize_fresh_database(engine)
+    with Session(engine) as session:
+        program = Program(
+            name="Synthetic",
+            authorized_scope=["example.test"],
+            excluded_scope=[],
+            rate_limit=1,
+        )
+        first_investigation = Investigation(program=program, status="running")
+        second_investigation = Investigation(program=program, status="running")
+        first_asset = Asset(
+            investigation=first_investigation, hostname="example.test"
+        )
+        second_asset = Asset(
+            investigation=second_investigation, hostname="example.test"
+        )
+        task = Task(
+            investigation=first_investigation,
+            kind="research_brief",
+            status="completed",
+            title="synthetic brief",
+        )
+        observation = Observation(
+            asset=second_asset,
+            observation_type="endpoint_inventory",
+            data={"url": "https://example.test/"},
+        )
+        session.add_all([task, observation])
+        session.flush()
+        session.add(
+            TaskObservation(
+                task_id=task.id,
+                observation_id=observation.id,
+                role="input",
+            )
+        )
+        with pytest.raises(IntegrityError, match="same investigation"):
+            session.flush()
+        session.rollback()
+    engine.dispose()
+
+
+def test_readiness_rejects_missing_or_altered_task_observation_triggers(
+    tmp_path: Path,
+) -> None:
+    for trigger_name, table_name in (
+        *SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS.items(),
+        *SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS.items(),
+        *SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS.items(),
+    ):
+        for altered in (False, True):
+            engine = create_database_engine(
+                f"sqlite+pysqlite:///{tmp_path / f'{trigger_name}-{altered}.db'}"
+            )
+            initialize_fresh_database(engine)
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f'DROP TRIGGER "{trigger_name}"')
+                if altered:
+                    operation = (
+                        "DELETE"
+                        if trigger_name in SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS
+                        else "UPDATE"
+                    )
+                    connection.exec_driver_sql(
+                        f'CREATE TRIGGER "{trigger_name}" BEFORE {operation} '
+                        f'ON "{table_name}" WHEN 0 BEGIN SELECT RAISE(ABORT, '
+                        "'ineffective trigger'); END"
+                    )
+            with pytest.raises(
+                DatabaseNotReadyError, match="task-observation protection triggers"
+            ):
+                require_schema_ready(engine)
+            engine.dispose()
+
+
 def test_fresh_initialization_refuses_nonempty_unversioned_database(
     tmp_path: Path,
 ) -> None:
@@ -154,7 +377,7 @@ def test_runtime_readiness_refuses_legacy_schema_without_migrating(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-runtime.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", path)
+    _create_synthetic_versioned_database(path, 0)
     before = path.read_bytes()
     with pytest.raises(DatabaseNotReadyError, match="migrate_database"):
         open_ready_database(f"sqlite+pysqlite:///{path}")
@@ -211,6 +434,447 @@ def test_readiness_rejects_altered_retention_trigger(
         engine.dispose()
 
 
+def test_readiness_rejects_missing_historical_update_trigger(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'missing-immutability-trigger.db'}"
+    )
+    initialize_fresh_database(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TRIGGER immutable_observations")
+
+    try:
+        with pytest.raises(DatabaseNotReadyError, match="immutability triggers"):
+            require_schema_ready(engine)
+    finally:
+        engine.dispose()
+
+
+def test_version_four_database_migrates_to_immutable_evidence_triggers(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'v4-immutable-evidence.db'}"
+    )
+    initialize_fresh_database(engine)
+    with engine.begin() as connection:
+        for trigger_name in SQLITE_IMMUTABILITY_TRIGGERS:
+            connection.exec_driver_sql(f'DROP TRIGGER "{trigger_name}"')
+        connection.exec_driver_sql(
+            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8)"
+        )
+        connection.exec_driver_sql("DROP TABLE IF EXISTS task_observations")
+        connection.exec_driver_sql("DROP TABLE IF EXISTS observation_fingerprints")
+
+    try:
+        assert preflight_migration(engine) == 4
+        migrate_database(engine)
+        assert require_schema_ready(engine) == migrations.LATEST_SCHEMA_VERSION
+        with engine.connect() as connection:
+            installed = {
+                name
+                for (name,) in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+        assert set(SQLITE_IMMUTABILITY_TRIGGERS).issubset(installed)
+    finally:
+        engine.dispose()
+
+
+def test_synthetic_version_five_upgrade_preserves_records_and_installs_v6_and_v7_protections(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "synthetic-v5-upgrade.db"
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    initialize_fresh_database(engine)
+    with Session(engine) as session:
+        program = Program(
+            name="Synthetic v5",
+            authorized_scope=["example.test"],
+            excluded_scope=[],
+            rate_limit=1,
+        )
+        investigation = Investigation(program=program, status="running")
+        asset = Asset(investigation=investigation, hostname="example.test")
+        task = Task(
+            investigation=investigation,
+            kind="inventory",
+            status="completed",
+            title="existing task",
+        )
+        observation = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"url": "https://example.test/", "status_code": 200},
+        )
+        duplicate = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"status_code": 200, "url": "https://example.test/"},
+        )
+        session.add_all([task, observation, duplicate])
+        session.commit()
+        task_id = task.id
+        observation_id = observation.id
+        duplicate_id = duplicate.id
+        expected_observation_data = observation.data
+
+    engine.dispose()
+    with sqlite3.connect(path) as database:
+        database.execute("PRAGMA foreign_keys=OFF")
+        for trigger_name in (
+            *SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+            *SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+            *SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+        ):
+            database.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+        database.execute("DROP TABLE observation_fingerprints")
+        database.execute("DROP TABLE task_observations")
+        database.execute("DELETE FROM schema_migrations WHERE version IN (6, 7, 8)")
+
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    try:
+        assert preflight_migration(engine) == 5
+        migrate_database(engine)
+        assert require_schema_ready(engine) == migrations.LATEST_SCHEMA_VERSION
+        with Session(engine) as session:
+            assert session.get(Task, task_id) is not None
+            migrated_observation = session.get(Observation, observation_id)
+            assert migrated_observation is not None
+            assert migrated_observation.data == expected_observation_data
+            fingerprint = session.get(ObservationFingerprint, observation_id)
+            assert fingerprint is not None
+            assert fingerprint.duplicate_of_observation_id is None
+            duplicate_fingerprint = session.get(ObservationFingerprint, duplicate_id)
+            assert duplicate_fingerprint is not None
+            assert duplicate_fingerprint.duplicate_of_observation_id == observation_id
+            assert session.scalar(select(TaskObservation.id)) is None
+            link = TaskObservation(
+                task_id=task_id,
+                observation_id=observation_id,
+                role="output",
+            )
+            session.add(link)
+            session.commit()
+            link_id = link.id
+
+        migrate_database(engine)
+        with Session(engine) as session:
+            preserved_link = session.get(TaskObservation, link_id)
+            assert preserved_link is not None
+            assert (
+                preserved_link.task_id,
+                preserved_link.observation_id,
+                preserved_link.role,
+            ) == (task_id, observation_id, "output")
+        with engine.connect() as connection:
+            triggers = {
+                name
+                for (name,) in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+        assert {
+            *SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+            *SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+            *SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+        }.issubset(triggers)
+    finally:
+        engine.dispose()
+
+
+def test_synthetic_legacy_upgrade_preserves_observations_and_builds_fingerprints(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "synthetic-legacy-upgrade.db"
+    _create_legacy_test_database(path)
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "INSERT INTO programs "
+            "(id, name, authorized_scope, excluded_scope, rate_limit, created_at) "
+            "VALUES (1, 'Synthetic legacy', '[\"example.test\"]', '[]', 1, "
+            "'2026-01-01 00:00:00')"
+        )
+        database.execute(
+            "INSERT INTO investigations "
+            "(id, program_id, status, started_at, ended_at) "
+            "VALUES (1, 1, 'running', '2026-01-01 00:00:00', NULL)"
+        )
+        database.execute(
+            "INSERT INTO assets (id, investigation_id, hostname, discovered_at) "
+            "VALUES (1, 1, 'example.test', '2026-01-01 00:00:00')"
+        )
+        database.execute(
+            "INSERT INTO observations "
+            "(id, asset_id, hypothesis_id, observation_type, data, created_at) "
+            "VALUES "
+            "(1, 1, NULL, 'endpoint_inventory', "
+            "'{\"url\":\"https://example.test/\",\"status_code\":200}', "
+            "'2026-01-01 00:00:00'), "
+            "(2, 1, NULL, 'endpoint_inventory', "
+            "'{\"status_code\":200,\"url\":\"https://example.test/\"}', "
+            "'2026-01-01 00:01:00')"
+        )
+
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    try:
+        assert preflight_migration(engine) == 0
+        migrate_database(engine)
+        assert require_schema_ready(engine) == migrations.LATEST_SCHEMA_VERSION
+        with Session(engine) as session:
+            observations = session.scalars(
+                select(Observation).order_by(Observation.id)
+            ).all()
+            assert [observation.id for observation in observations] == [1, 2]
+            assert observations[0].data == observations[1].data
+            first = session.get(ObservationFingerprint, 1)
+            duplicate = session.get(ObservationFingerprint, 2)
+            assert first is not None and duplicate is not None
+            assert duplicate.duplicate_of_observation_id == 1
+            assert session.scalar(select(TaskObservation.id)) is None
+    finally:
+        engine.dispose()
+
+
+def test_historical_task_links_only_v6_database_migrates_to_v7_and_backfills_fingerprints(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "historical-v6-task-links.db"
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    initialize_fresh_database(engine)
+    with Session(engine) as session:
+        program = Program(
+            name="Historical v6",
+            authorized_scope=["example.test"],
+            excluded_scope=[],
+            rate_limit=1,
+        )
+        investigation = Investigation(program=program, status="running")
+        asset = Asset(investigation=investigation, hostname="example.test")
+        task = Task(
+            investigation=investigation,
+            kind="inventory",
+            status="completed",
+            title="existing inventory task",
+        )
+        observation = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"url": "https://example.test/", "status_code": 200},
+        )
+        duplicate = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"status_code": 200, "url": "https://example.test/"},
+        )
+        session.add_all([task, observation, duplicate])
+        session.flush()
+        session.add_all(
+            [
+                TaskObservation(
+                    task_id=task.id, observation_id=observation.id, role="output"
+                ),
+                TaskObservation(
+                    task_id=task.id, observation_id=duplicate.id, role="output"
+                ),
+            ]
+        )
+        session.commit()
+        task_id = task.id
+        observation_id = observation.id
+        duplicate_id = duplicate.id
+
+    # Rewind to the historical task-links-only v6 contract: keep task_observations
+    # and its protections, but remove the v7 fingerprint table and history row.
+    engine.dispose()
+    with sqlite3.connect(path) as database:
+        database.execute("PRAGMA foreign_keys=OFF")
+        for trigger_name in (
+            *SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS,
+            *SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS,
+        ):
+            database.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+        database.execute("DROP TABLE observation_fingerprints")
+        database.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    try:
+        assert preflight_migration(engine) == 6
+        with engine.connect() as connection:
+            assert not inspect(connection).has_table("observation_fingerprints")
+            assert inspect(connection).has_table("task_observations")
+            assert _migration_history(connection)[-1] == (6, "task_observation_links")
+
+        migrate_database(engine)
+        assert require_schema_ready(engine) == migrations.LATEST_SCHEMA_VERSION
+
+        with Session(engine) as session:
+            assert session.get(Task, task_id) is not None
+            assert session.get(Observation, observation_id) is not None
+            assert session.get(Observation, duplicate_id) is not None
+            links = session.scalars(
+                select(TaskObservation).order_by(TaskObservation.id)
+            ).all()
+            assert [link.observation_id for link in links] == [
+                observation_id,
+                duplicate_id,
+            ]
+            first = session.get(ObservationFingerprint, observation_id)
+            duplicate = session.get(ObservationFingerprint, duplicate_id)
+            assert first is not None and duplicate is not None
+            assert duplicate.duplicate_of_observation_id == observation_id
+            assert duplicate.fingerprint == first.fingerprint
+    finally:
+        engine.dispose()
+
+def test_interim_v6_database_with_fingerprint_structures_migrates_idempotently(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "interim-v6-fingerprints.db"
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    initialize_fresh_database(engine)
+    with Session(engine) as session:
+        program = Program(
+            name="Interim v6",
+            authorized_scope=["example.test"],
+            excluded_scope=[],
+            rate_limit=1,
+        )
+        investigation = Investigation(program=program, status="running")
+        asset = Asset(investigation=investigation, hostname="example.test")
+        first = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"url": "https://example.test/a"},
+        )
+        second = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"url": "https://example.test/b"},
+        )
+        session.add_all([first, second])
+        session.commit()
+        first_id = first.id
+        second_id = second.id
+
+    # Simulate the interim v6 that already contained fingerprint structures but
+    # only recorded version 6 in history. Remove one fingerprint to prove v7
+    # backfills only what is missing while preserving the existing row.
+    engine.dispose()
+    with sqlite3.connect(path) as database:
+        database.execute("PRAGMA foreign_keys=OFF")
+        for trigger_name in SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS:
+            database.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+        database.execute(
+            "DELETE FROM observation_fingerprints WHERE observation_id = ?",
+            (second_id,),
+        )
+        database.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    try:
+        assert preflight_migration(engine) == 6
+        with engine.connect() as connection:
+            assert inspect(connection).has_table("observation_fingerprints")
+            assert _migration_history(connection)[-1] == (6, "task_observation_links")
+            preserved = connection.scalar(
+                text(
+                    "SELECT fingerprint FROM observation_fingerprints "
+                    "WHERE observation_id = :id"
+                ),
+                {"id": first_id},
+            )
+            assert preserved is not None
+
+        migrate_database(engine)
+        assert require_schema_ready(engine) == migrations.LATEST_SCHEMA_VERSION
+
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    "SELECT fingerprint FROM observation_fingerprints "
+                    "WHERE observation_id = :id"
+                ),
+                {"id": first_id},
+            ) == preserved
+            assert connection.scalar(
+                text(
+                    "SELECT fingerprint FROM observation_fingerprints "
+                    "WHERE observation_id = :id"
+                ),
+                {"id": second_id},
+            ) is not None
+            installed = {
+                name
+                for (name,) in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+            assert set(SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS).issubset(
+                installed
+            )
+            assert set(SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS).issubset(
+                installed
+            )
+            assert _migration_history(connection)[-1] == (8, "program_required_request_headers")
+    finally:
+        engine.dispose()
+
+
+
+
+
+def test_immutability_migration_validation_failure_rolls_back_trigger_and_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_database_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'failed-immutability-migration.db'}"
+    )
+    initialize_fresh_database(engine)
+    with engine.begin() as connection:
+        for trigger_name in SQLITE_IMMUTABILITY_TRIGGERS:
+            connection.exec_driver_sql(f'DROP TRIGGER "{trigger_name}"')
+        connection.exec_driver_sql(
+            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8)"
+        )
+        connection.exec_driver_sql("DROP TABLE IF EXISTS task_observations")
+        connection.exec_driver_sql("DROP TABLE IF EXISTS observation_fingerprints")
+
+    original_validate = migrations._validate_schema_contract
+
+    def fail_version_six_validation(connection: Connection, version: int) -> None:
+        if version == 6:
+            raise MigrationError("simulated task-observation schema validation failure")
+        original_validate(connection, version)
+
+    monkeypatch.setattr(
+        migrations, "_validate_schema_contract", fail_version_six_validation
+    )
+    try:
+        with pytest.raises(MigrationError, match="changes were rolled back"):
+            migrate_database(engine)
+        with engine.connect() as connection:
+            assert _migration_history(connection)[-1][0] == 5
+            assert not inspect(connection).has_table("task_observations")
+            assert not inspect(connection).has_table("observation_fingerprints")
+            installed = {
+                name
+                for (name,) in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+        assert set(SQLITE_IMMUTABILITY_TRIGGERS).issubset(installed)
+        assert not {
+            *SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+            *SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+            *SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+        }.intersection(installed)
+    finally:
+        engine.dispose()
+
+
 def test_online_backup_is_verified_and_never_overwrites_existing_file(
     tmp_path: Path,
 ) -> None:
@@ -262,7 +926,7 @@ def test_backup_failure_prevents_cli_migration(
     from scripts import migrate_database as migration_cli
 
     path = tmp_path / "legacy-cli.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", path)
+    _create_synthetic_versioned_database(path, 0)
     before = path.read_bytes()
 
     def fail_backup(*_args: object, **_kwargs: object) -> object:
@@ -287,14 +951,14 @@ def test_explicit_migration_command_creates_verified_backup(
 
     path = tmp_path / "legacy-cli-success.db"
     backup_path = tmp_path / "legacy-cli-backup.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", path)
+    _create_synthetic_versioned_database(path, 0)
     assert migration_cli.main(
         ["--database", str(path), "--backup", str(backup_path),
          "--confirm-writers-stopped"]
     ) == 0
     output = capsys.readouterr().out
     assert "Verified backup:" in output
-    assert "Migration complete; schema version 3." in output
+    assert f"Migration complete; schema version {migrations.LATEST_SCHEMA_VERSION}." in output
     assert backup_path.is_file()
     assert Path(f"{backup_path}.sha256").is_file()
     with sqlite3.connect(backup_path) as backup:
@@ -302,7 +966,7 @@ def test_explicit_migration_command_creates_verified_backup(
     with sqlite3.connect(path) as migrated:
         assert migrated.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (3,)
+        ).fetchone() == (migrations.LATEST_SCHEMA_VERSION,)
 
 
 def test_fresh_database_schema_and_history_roll_back_together(
@@ -344,7 +1008,7 @@ def test_migration_cli_requires_human_writer_stop_acknowledgment(
     from scripts import migrate_database as migration_cli
 
     path = tmp_path / "writer-confirmation.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", path)
+    _create_synthetic_versioned_database(path, 0)
     before = path.read_bytes()
     assert migration_cli.main(["--database", str(path)]) == 2
     assert "does not detect other processes" in capsys.readouterr().err
@@ -355,7 +1019,7 @@ def test_legacy_orphaned_rows_are_rejected_before_backup_or_migration(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-orphan.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", path)
+    _create_synthetic_versioned_database(path, 0)
     with sqlite3.connect(path) as database:
         database.execute("PRAGMA foreign_keys=OFF")
         database.execute(
@@ -427,7 +1091,7 @@ def test_migration_cli_rejects_legacy_orphan_before_backup_or_schema_change(
 
     path = tmp_path / "legacy-orphan-cli.db"
     backup_path = tmp_path / "legacy-orphan-backup.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", path)
+    _create_synthetic_versioned_database(path, 0)
     with sqlite3.connect(path) as database:
         database.execute("PRAGMA foreign_keys=OFF")
         database.execute(
@@ -476,7 +1140,7 @@ def test_post_migration_schema_validation_failure_rolls_back_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "post-validation-failure.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", path)
+    _create_synthetic_versioned_database(path, 0)
     engine = create_database_engine(f"sqlite+pysqlite:///{path}")
     original_validate = migrations._validate_schema_contract
 
@@ -581,18 +1245,17 @@ def test_history_cannot_claim_success_when_required_constraint_is_missing(
         engine.dispose()
 
 
-@pytest.mark.parametrize("database_name", ["lab_evidence.db", "lab_evidence_v3.db"])
-def test_legacy_database_copy_migrates_without_changing_existing_rows(
-    tmp_path: Path, database_name: str
+@pytest.mark.parametrize("source_version", [0, 4, 5])
+def test_synthetic_legacy_database_migrates_without_changing_existing_rows(
+    tmp_path: Path, source_version: int
 ) -> None:
-    source = REPO_ROOT / database_name
-    copied_database = tmp_path / database_name
-    shutil.copy2(source, copied_database)
-    original_snapshot = _database_snapshot(copied_database)
+    database_path = tmp_path / f"synthetic-v{source_version}.db"
+    _create_synthetic_versioned_database(database_path, source_version)
+    original_snapshot = _database_snapshot(database_path)
 
-    engine = create_database_engine(f"sqlite+pysqlite:///{copied_database}")
+    engine = create_database_engine(f"sqlite+pysqlite:///{database_path}")
     try:
-        assert preflight_migration(engine) == 0
+        assert preflight_migration(engine) == source_version
         migrate_database(engine)
         require_schema_ready(engine)
         inspector = inspect(engine)
@@ -601,15 +1264,21 @@ def test_legacy_database_copy_migrates_without_changing_existing_rows(
             column["name"]
             for column in inspector.get_columns("investigations")
         } >= {"max_tasks", "max_llm_calls"}
-        migrated_snapshot = _database_snapshot(copied_database)
+        migrated_snapshot = _database_snapshot(database_path)
         for table_name, original_table in original_snapshot.items():
             migrated_table = migrated_snapshot[table_name]
             original_columns = original_table["columns"]
             assert set(original_columns).issubset(migrated_table["columns"])
-            assert [
+            migrated_rows = [
                 {column: row[column] for column in original_columns}
                 for row in migrated_table["rows"]
-            ] == original_table["rows"]
+            ]
+            if table_name == "schema_migrations":
+                assert migrated_rows[: len(original_table["rows"])] == (
+                    original_table["rows"]
+                )
+            else:
+                assert migrated_rows == original_table["rows"]
 
         investigation_columns = migrated_snapshot["investigations"]["columns"]
         for budget_column in ("max_tasks", "max_llm_calls"):
@@ -649,12 +1318,41 @@ def test_repeated_initialization_and_migration_are_idempotent(
         engine.dispose()
 
 
+def test_migration_adds_database_enforced_task_deduplication_key(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "task-deduplication-upgrade.db"
+    engine = create_database_engine(f"sqlite+pysqlite:///{path}")
+    initialize_fresh_database(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP INDEX uq_tasks_dedupe_key")
+        connection.exec_driver_sql("ALTER TABLE tasks DROP COLUMN dedupe_key")
+        connection.exec_driver_sql("DELETE FROM schema_migrations WHERE version >= 4")
+    assert preflight_migration(engine) == 3
+
+    migrate_database(engine)
+    assert require_schema_ready(engine) == migrations.LATEST_SCHEMA_VERSION
+    with engine.connect() as connection:
+        task_columns = {
+            column["name"] for column in inspect(connection).get_columns("tasks")
+        }
+        task_indexes = inspect(connection).get_indexes("tasks")
+    assert "dedupe_key" in task_columns
+    assert any(
+        index["name"] == "uq_tasks_dedupe_key"
+        and index["unique"]
+        and index["column_names"] == ["dedupe_key"]
+        for index in task_indexes
+    )
+    engine.dispose()
+
+
 def test_failed_migration_rolls_back_its_ddl_and_can_be_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    copied_database = tmp_path / "legacy.db"
-    shutil.copy2(REPO_ROOT / "lab_evidence.db", copied_database)
-    engine = create_database_engine(f"sqlite+pysqlite:///{copied_database}")
+    synthetic_database = tmp_path / "legacy.db"
+    _create_synthetic_versioned_database(synthetic_database, 0)
+    engine = create_database_engine(f"sqlite+pysqlite:///{synthetic_database}")
     original_migrations = migrations._MIGRATIONS
 
     def fail_after_ddl(connection: Connection) -> None:

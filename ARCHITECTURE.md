@@ -39,7 +39,7 @@ inspect the reported failure, and verify the backup checksum and contents
 before an operator manually chooses a recovery action. Never overwrite the
 failed database automatically.
 
-The current schema version is 3:
+The current schema version is 7:
 
 1. `investigation_budgets` adds nullable `max_tasks` and `max_llm_calls` columns
    to `investigations` when they are absent.
@@ -48,6 +48,22 @@ The current schema version is 3:
    their records are left in place.
 3. `sqlite_historical_record_retention` adds SQLite `BEFORE DELETE` triggers to
    retained evidence and audit tables.
+4. `concurrent_task_deduplication` adds a nullable, unique `tasks.dedupe_key`
+   index. Inventory-planned tasks use stable keys so concurrent planning cannot
+   persist duplicate task chains; unrelated operator-created tasks may leave
+   the key NULL.
+5. `sqlite_historical_record_immutability` adds SQLite `BEFORE UPDATE` triggers
+   for retained evidence and audit tables. Existing rows are preserved; updates
+   are refused rather than rewritten.
+6. `task_observation_links` creates the immutable `task_observations`
+   relationship table plus its retention, immutability, and cross-investigation
+   ownership triggers. This is the historical task-observation contract only;
+   it does not require fingerprint storage.
+7. `observation_fingerprints` creates fingerprint storage and its retention and
+   immutability triggers, and idempotently backfills fingerprints for existing
+   observations without fabricating task links. A version-6 database that
+   already contains fingerprint structures upgrades through this step without
+   losing data.
 
 Migration history and each migration's DDL are committed together. A failed
 migration rolls back that step and can be retried; previously completed steps
@@ -75,17 +91,26 @@ created tables declare `RESTRICT`.
 Standalone `Observation`, `ObservationProvenance`,
 `HypothesisSupportingObservation`, `Verdict`, `Finding`, `TaskEvent`, and
 `PromotionAudit` records cannot be permanently deleted through normal ORM
-operations (including bulk deletes) or direct SQL. SQLAlchemy session guards
-reject ORM deletions, and SQLite `BEFORE DELETE` triggers using
-`RAISE(ABORT, ...)` provide the final database-level enforcement, including
-against deletes initiated by cascading operations. The integrity checker
-verifies that every required trigger exists and is a `BEFORE DELETE` trigger
-using `RAISE(ABORT, ...)`; it reports missing or altered triggers without
-recreating them.
+operations (including bulk deletes), and cannot be updated through normal ORM
+operations or direct SQL. SQLAlchemy session guards reject ORM updates and
+deletions; SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers using
+`RAISE(ABORT, ...)` provide database-level enforcement. The integrity checker
+verifies each required trigger's table, timing, operation, and effective
+definition; it reports missing or altered triggers without recreating them.
+Evidence writers validate probe metadata before persistence, derive comparison
+flags from the validated probe records, and accept only bounded authorization
+snapshot fields so arbitrary caller data cannot be copied into provenance.
+New ORM observations must carry a non-empty type and finite JSON-object data;
+the evidence helper rejects malformed probe values and requires supplied
+authorization snapshots to match the asset and current program scope. URL query
+values and fragments, sensitive response headers, and secret-shaped response
+header values are excluded from persisted probe evidence. This does not claim
+that arbitrary target-controlled DNS text or legacy rows are credential-free.
 
 Investigation lifecycle transitions remain the supported way to close work;
 archival or status transitions are preferred to deleting evidence. SQLite
-retention triggers are implemented in schema migration version 3.
+retention triggers are implemented in schema migration version 3 and
+immutability triggers in version 5.
 
 SQLite migrations acquire an immediate write lock and use transactional DDL.
 PostgreSQL uses transaction-scoped advisory locking and SQLAlchemy-generated
@@ -95,10 +120,10 @@ changes must add a new migration version rather than rewriting an already
 released migration.
 
 The referential-integrity behavior has been tested with SQLite only. SQLAlchemy
-ORM deletion guards apply when writes pass through the configured ORM session,
-but PostgreSQL direct-SQL retention triggers are not implemented. PostgreSQL
-migration locking and database-level delete behavior remain unverified against
-a PostgreSQL server.
+ORM update/delete guards apply when writes pass through the configured ORM
+session, but PostgreSQL direct-SQL retention and immutability triggers are not
+implemented. PostgreSQL migration locking and database-level delete/update
+behavior remain unverified against a PostgreSQL server.
 
 ## Mission 003: Offline researcher workflow
 
@@ -196,7 +221,7 @@ V4 adds a persistent investigation lifecycle on top of V3: `verification.investi
 
 ### Investigation tasks (human-triggered only)
 
-The V4 orchestration foundation makes an investigation a container for work. `verification.investigation_tasks` records operator-tracked `Task` rows inside a running investigation: `create_task(investigation_id, session, *, kind, title)` adds a `pending` task, `start_task(task_id, session)` moves it to `running`, `complete_task(task_id, session, *, final_status, result_summary=None)` ends it as `completed`, `failed`, or `cancelled`, and `list_tasks(investigation_id, session)` reads them in creation order. A task is a **record, not a job**: nothing in the project picks one up or runs it, there is no scheduler, dispatcher, planner, or loop, and each transition happens only because an operator called the function. `create_task` requires an existing investigation whose status is `running`, a `kind` from the fixed allowlist `recon`, `inventory`, `hypothesis_generation`, `hypothesis_review`, `verification`, `report`, and `params` that are exactly that kind's `TASK_PARAMS` — a `verification` task must name a positive `hypothesis_id` already in the investigation, and no other kind may carry one. `completed`/`failed` require a running task, `cancelled` also accepts a pending one, and terminal tasks never change. The writers flush and never commit, import nothing from the gateway, make no request, and never touch a `Hypothesis`, `Finding`, `Verdict`, or `Observation`.
+The V4 orchestration foundation makes an investigation a container for work. `verification.investigation_tasks` records operator-tracked `Task` rows inside a running investigation: `create_task(investigation_id, session, *, kind, title)` adds a `pending` task, `start_task(task_id, session)` moves it to `running`, `complete_task(task_id, session, *, final_status, result_summary=None)` ends it as `completed`, `failed`, or `cancelled`, and `list_tasks(investigation_id, session)` reads them in creation order. A task is a **record, not a job**: there is no scheduler or autonomous worker, and each transition is initiated by an operator command. `create_task` requires an existing running investigation, a kind from the fixed allowlist, and exactly that kind's `TASK_PARAMS`; a `verification` task must name a positive `hypothesis_id` already in the investigation. `completed`/`failed` require a running task, `cancelled` also accepts a pending one, and terminal tasks never change. Task lifecycle functions flush and never commit, import nothing from the gateway, and never touch hypotheses, findings, verdicts, or observations. Status transitions use conditional database updates inside savepoints, and the transition plus its append-only task event either succeeds together or rolls back together.
 
 Two hard budgets bound an investigation's work, carried as nullable `Investigation` columns (`max_tasks`, `max_llm_calls`) whose `NULL` falls back to the module defaults (`MAX_TASKS_PER_INVESTIGATION = 50`, `MAX_LLM_CALLS_PER_INVESTIGATION = 10`). `create_task` — the only writer of tasks — enforces both and raises `BudgetExhausted` (a `ValueError`) instead of adding a task beyond them; the LLM budget counts `hypothesis_generation` tasks, the project's only production path to the model, so the cap is hit before any model call. `plan_next_tasks` applies the task budget defensively as well.
 
@@ -213,25 +238,36 @@ Close policy: **strict block.** `close_investigation()` raises `OpenTasksError` 
 - `started_at` — when the operator started it; `NULL` for a task cancelled before it started, which distinguishes "dropped" from "attempted".
 - `ended_at` — when it reached a terminal status, mirroring `Investigation.ended_at`.
 - `result_summary` — optional operator note on the outcome (up to 2000 characters); it is a note, never evidence, and nothing reads it as a verdict.
+- `dedupe_key` — nullable unique key for planner and retry idempotency; ordinary tasks may leave it NULL.
 
-The schema change is additive: explicit migration version 2 creates missing task and verification tables. `init_db()` is deprecated and fresh-database-only; it refuses an existing database and does not migrate it.
+The schema is additive: migration version 2 creates task and verification tables, version 4 adds the nullable task deduplication key/index, version 6 adds the `task_observations` relationship table, and version 7 adds fingerprint storage with backfill. `init_db()` is deprecated and fresh-database-only; it refuses an existing database and does not migrate it.
 
 ### Operator runs own an investigation and its tasks
 
-An operator script can now own the whole container, not just record a task. `orchestration.session_helpers.ensure_running_investigation()` returns a running `Investigation` (starting one from a `program_id` when only a program is given), and `orchestration.session_helpers.run_under_investigation()` then creates a task through `create_task` and runs it — either by dispatching its `kind` through `orchestration.task_runner.run_task` (for kinds already in `DISPATCH_TARGETS`) or by calling the operator's `work` callable and completing the task. Both helpers flush only; the caller (the script) commits. `scripts/collect_inventory.py` is the first wiring: it opens or starts an investigation, ensures an `Asset` for the target host, and runs the existing `collect_seed_inventory()` as an `inventory` task — so a live collector run leaves a durable `Investigation`, `Asset`, and `Task`, and still never promotes a hypothesis.
+An operator script can own the container and its task records. `orchestration.session_helpers.ensure_running_investigation()` returns a running `Investigation`; `run_under_investigation()` creates and dispatches an existing task kind or calls an operator work function. Library helpers leave commit ownership to the caller. The operator execution CLIs explicitly checkpoint a task's `running` state and `started`/`dispatched` events before network-facing work, so an interrupted process leaves a recoverable stuck task. `scripts/collect_inventory.py` uses the same checkpoint mode for CLI execution; direct library calls remain caller-transaction scoped.
 
-Those tasks are the same records V5 recovery operates on: `verification.task_recovery.find_stuck_tasks()` lists an investigation's overrun `running` tasks, and `scripts/recover_investigation.py --mark-failed` / `--retry` repair them through the same task layer. Recovery stays human-initiated — there is still no scheduler, daemon, or auto-retry.
+Those tasks are the same records recovery operates on: `verification.task_recovery.find_stuck_tasks()` lists an investigation's overrun `running` tasks, and `scripts/recover_investigation.py --mark-failed` / `--retry` repair them through the same task layer. Status updates are conditional database updates, preventing two sessions with stale `pending` state from both starting the same task. Each transition and its audit event use one savepoint. Retry creation uses the unique `retry:v1:<original-task-id>` key and records its link in the same savepoint; a failed retry-audit write leaves no retry task. Recovery stays human-initiated — no scheduler, daemon, or auto-retry exists, and a retry remains pending until a separate invocation supplies fresh scope authorization and any required approval.
 
 ## V6 Scope (first slice)
 
-The V6 first slice is a **supervised cycle**, not an autonomous loop: one explicit operator invocation proposes an investigation's ready tasks and, only when told to, runs them once each — then stops. `orchestration.supervised_cycle.run_supervised_cycle(investigation_id, session, *, execute, threshold_seconds=3600.0, authorize=None, allow_private_network=False, verification_plan=None)` is the single library entry point:
+The supervised cycle is a **human-triggered bounded loop**, not an autonomous service: an explicit invocation proposes ready tasks and, only when told to, runs them once each. `orchestration.supervised_cycle.run_supervised_cycle(investigation_id, session, *, execute, threshold_seconds=3600.0, authorize=None, allow_private_network=False, verification_plan=None, approve_verification=False)` is the library entry point:
 
-* **Planning always, executing gated.** It calls `plan_next_tasks` even for a dry run (`execute=False`), which returns exactly the proposals and writes nothing. `execute=True` refuses a non-`running` investigation (`ValueError`) and returns without running while any task is stuck (`find_stuck_tasks`), telling the operator to run `scripts/recover_investigation.py` first.
+* **Dry-run preview, explicit planning on execute.** `execute=False` previews ready work and the inventory-derived chain without creating tasks or changing session state. `execute=True` refuses a non-`running` investigation (`ValueError`) and returns without planning more work while any task is stuck (`find_stuck_tasks`), telling the operator to recover first. Once clear, it calls `plan_inventory_research_tasks()` before asking `plan_next_tasks()` for executable work.
 * **Budgets respected, never bypassed.** `plan_next_tasks` slices to `Investigation.max_tasks` and `create_task` enforces the task and LLM caps, so a cycle can only propose and run what the budget allows.
-* **Stop on first failure.** Proposed tasks run in order; the first `run_task` exception is recorded in the returned `CycleReport` and the cycle stops, so a failed dependency never cascades into later tasks.
+* **Stop at safety gates and failures.** Proposed tasks run in deterministic creation order; the first failure stops the cycle. A verification task remains pending unless the caller supplies a transient plan and `approve_verification=True`; the CLI additionally requires `--yes --lab --approve-verification --verification-plan-stdin` for that path. The verifier remains lab-only.
 * **Flush only, no hypothesis.** The helper never commits and never writes `Hypothesis.status`; `scripts/run_supervised_investigation.py` is the operator entry point that commits once at the end.
 
-`scripts/run_supervised_investigation.py <id>` is a dry run (print the plan, exit 0, no writes). `--yes` runs one cycle; `--yes --max-cycles N` (N capped at 5) runs at most N cycles in one process, re-planning between them and stopping early when a cycle proposes nothing or hits the stop-on-first-failure policy. This is deliberately **not autonomous multi-agent operation yet**: there is no scheduler, daemon, free-running swarm, or automatic promotion.
+`scripts/run_supervised_investigation.py <id>` is a dry run (prints ready tasks and inventory task proposals, exit 0, no writes). `--yes` runs one cycle; `--yes --max-cycles N` (N capped at 5) runs at most N cycles in one process, re-planning between them and stopping on no work, a verification refusal, a stuck task, or a failure. Execution mode commits task planning together with each task's running checkpoint before dispatch; dry-run mode stays read-only. Research brief generation is offline; hypothesis generation may call the configured LLM only when the operator explicitly executes that task. Passive recon may perform DNS lookups only when explicitly executed with current scope authorization. No scheduler, daemon, or automatic finding promotion exists.
+
+### Inventory planning, research, and verification handoff (Missions 004–006)
+
+`orchestration.inventory_planner.plan_inventory_research_tasks()` consumes stored `endpoint_inventory` observations only. It validates HTTP(S) URL shape, exact asset-host consistency, and current program scope; it defers incomplete or failed upstream work and enforces task/LLM budgets before creating a dependency chain: optional completed inventory tasks → `research_brief` → `hypothesis_generation` → manual `hypothesis_review` tasks. Repeated planning reuses existing records. SQLite planning acquires an immediate transaction-scoped write lock before reading inventory, serializing concurrent planners; stable nullable `Task.dedupe_key` values and a unique index enforce duplicate prevention at the database boundary. `preview_inventory_research_tasks()` returns the proposal shape under `session.no_autoflush` without writes.
+
+Repeated endpoint URLs (same scheme, host, effective port, path, and query; fragments ignored) produce one review task, and the planner reports the redundant observation ids. Review order is deterministic: HTTP 200/401/403 context first, successful redirects/other successful statuses next, and remaining statuses last. The proposal includes a reason stating that status is context and not proof or severity. Researcher brief observation cards identify missing provenance, response size, and body digest metadata explicitly; they do not infer that an evidence gap proves a vulnerability.
+
+`orchestration.task_runner.run_task()` dispatches existing passive DNS recon, the offline researcher brief, hypothesis generation, and the lab-only verifier. Recon requires the caller's scope authorizer; the brief makes no network or LLM call; generation is the existing LLM caller. Verification plan JSON is bounded, bound to one `hypothesis_id`, and read from stdin by `verification.plan_input`; request headers remain transient, request errors are not echoed, and evidence URL query strings/fragments are redacted before storage. Explicit approval and lab-mode opt-in are independently required, and one approval executes at most one verification task per invocation. `hypothesis_review` remains operator-controlled, and only the existing promotion gate can create a finding.
+
+Before dispatching a network task, the task runner intersects the invocation's authorizer with the program scope freshly loaded from the database. If current scope denies an inventory, recon, or verification target, the pending task is refused before it is marked running. Verification plan targets must also match the hostname of the hypothesis asset; program-level authorization alone cannot attach evidence from another asset to that hypothesis. Crash-recovery reasons are bounded and reject common credential-shaped values before they enter task history.
 
 ## Data Flow
 
@@ -243,7 +279,7 @@ The V6 first slice is a **supervised cycle**, not an autonomous loop: one explic
 6. `data.models` defines Program, Investigation, Task, Asset, and Observation. `data.db.initialize_fresh_database()` creates the schema only for an empty database; runtime entry points validate readiness and do not initialize or migrate.
 7. `verification.http_probe.probe_endpoint()` authorizes and pins a URL, sends one GET directly to the selected pinned IP, and returns status, sanitized/truncated headers, elapsed time, raw response-body byte count, and a SHA-256 hash of those bytes. The raw body is not retained; redirects are not followed; the request has an absolute deadline and a 1 MiB response limit.
 8. `verification.diff_check.compare_requests()` runs two independent authorized probes and reports only deterministic status, body-hash, content-length, and header differences. It does not interpret their security meaning; callers may pass distinct request headers, which are not included in the diff result.
-9. `verification.evidence.store_diff_evidence()` links an allowlisted diff result to a `Hypothesis` and its `Asset` via the hypothesis relationship. Hypotheses remain unverified by default; storing evidence does not classify a vulnerability.
+9. `verification.evidence.store_diff_evidence()` links an allowlisted diff result to a `Hypothesis` and its `Asset` via the hypothesis relationship. Hypotheses remain unverified by default; storing evidence does not classify a vulnerability. Durable evidence redacts URL query strings and fragments; request headers are never persisted, and sensitive response headers are filtered by the probe layer.
 10. `verification.run_verification.run_verification()` is a human-initiated, single-shot composition of hypothesis lookup, two-probe comparison, and evidence persistence. It never changes hypothesis status or commits the caller's transaction.
 11. `verification.http_probe.probe_lab_target()` is the single lab transport. It requires an explicit `allow_private_network=True` opt-in and a target marked `is_lab_target=True`, then delegates to the same private pinned transport used by `probe_endpoint()`; it never resolves or authorizes on its own.
 12. `verification.lab_verification.run_lab_verification()` is a separate manual-only path that explicitly opts into `pin_lab_url()` for both targets and uses the guarded `probe_lab_target()` transport, diff builder, and evidence writer. It is not called by `run_verification()`, workers, or recon.
@@ -251,7 +287,7 @@ The V6 first slice is a **supervised cycle**, not an autonomous loop: one explic
 14. `intelligence.hypothesis_generation.generate_hypotheses()` is the first live caller of `intelligence.llm_client.generate_completion()`. It loads the asset's observations, builds the summary, passes only `summary.text` as the user prompt plus `summary.untrusted` as marked untrusted context, parses `category: description` lines into `Hypothesis` rows, and `session.add()`/`session.flush()`es them with the hardcoded status `"unverified"`. It never commits, never probes, and lets `LLMClientError` propagate. An empty observation set means no model call and an empty list.
 15. `intelligence.prioritization.prioritize_hypotheses()` is a pure, offline sort of already-loaded rows: only rows whose status is exactly `"unverified"` are candidates, ordered by category weight (`access_control`/`idor` first), then newest first, then row id, category, and description. No session, network, LLM, or mutation of its input.
 16. `verification.verdict_checker.check_verdict()` is a pure function over one stored observation mapping and one `VerdictClaim`. It recomputes the compared flags from the recorded numbers rather than trusting any stored flag, returns `supported` / `refuted` / `inconclusive` with machine-readable reason codes, and fails closed to `inconclusive` on thin, malformed, or internally contradictory data. A control claim can never be `supported`; the only control outcomes are `refuted` (it matched, so it cannot discriminate) and `inconclusive` (`control_discriminated`).
-17. `verification.run_hypothesis_verification.run_hypothesis_verification()` executes a human-authored `VerificationTestPlan` of `RequestPair`s through the guarded `probe_lab_target()` transport only. It validates the whole plan (loopback-lab URLs, non-empty endpoints, claim/control pairing) before the first request, authorizes and pins **every** target in the plan before the first request, probes every control pair before recording any claim, stores claim verdicts plus one diff evidence row with `flush()`, and never calls `commit()`. It never writes `Hypothesis.status` and never stores request credentials.
+17. `verification.run_hypothesis_verification.run_hypothesis_verification()` executes a human-authored `VerificationTestPlan` of `RequestPair`s through the guarded `probe_lab_target()` transport only. It validates the whole plan (loopback-lab URLs, non-empty endpoints, claim/control pairing) before the first request, authorizes and pins **every** target in the plan before the first request, probes every control pair before recording any claim, stores claim verdicts plus one diff evidence row with `flush()`, and never calls `commit()`. It never writes `Hypothesis.status`; request headers remain transient, sensitive response headers are filtered, and durable evidence URLs omit query strings and fragments.
 18. `verification.verdict_integrity.verify_verdict()` binds a stored `Verdict` to the evidence row it judged, the hypothesis, and the recorded target URLs, and re-derives the judgement from the stored bytes. It is pure (no session, network, model, or clock) and returns a structured check with a reason code rather than raising. `digest_for()` computes the digest the writer stores; `evidence_digest()` hashes the canonical evidence content. The promotion gate and the report loader both call it, so a verdict that was edited, hand-written, or rebound to other evidence is rejected wherever it is consumed.
 19. `verification.finding_promotion.promote_to_finding()` is the human-only promotion gate and the only status writer in the project. It requires a named `approved_by`, an `unverified` hypothesis, at least one supported non-control verdict, and evidence owned by that hypothesis; it refuses if any verdict is `refuted` or fails its integrity check (hand-written, edited, or bound to other evidence); it sets the status to `verified`, creates the `Finding`, and writes a `PromotionAudit` row — all with `flush()`, leaving the commit to the caller.
 20. `verification.finding_report.render_finding_report()` is a pure deterministic Markdown renderer over a `FindingReportContext` loaded by `collect_finding_context()`. It renders the local-lab banner, finding/asset metadata, reproduction steps, the recorded status/bytes/hash comparison, the verdict table with reason codes, the recomputed verdict-integrity line, a bounded impact paragraph, explicit limitations, and the approval trail. The loader verifies every verdict against its evidence first, and the renderer refuses to render when the context has no supported verdict or no evidence.
@@ -264,7 +300,7 @@ The V6 first slice is a **supervised cycle**, not an autonomous loop: one explic
 - New hostname resolution should go through `gateway.resolver.authorized_resolve()`, not call `gateway.dns_pin` directly.
 - `verification.http_probe` uses a per-probe Requests adapter to connect to a `pin_url()`-validated address while preserving the hostname for the HTTP Host header and TLS server name. Any future HTTP client must preserve this invariant; resolving the URL again in the client would reintroduce DNS rebinding risk.
 - `verification.http_probe.probe_lab_target()` is the only supported lab transport and it is guarded: it rejects the request unless the caller passes `allow_private_network=True` and the target is lab-marked (`is_lab_target=True`, produced only by `pin_lab_url()`). `PinnedTarget.is_lab_target` defaults to `False`, so a public target can never satisfy the guard. It reuses `probe_endpoint()`'s pinned transport, keeping the Host/TLS/pinned-IP invariant in one module; `probe_endpoint()` remains the public-only entry point.
-- Probe evidence omits `Set-Cookie`, `Authorization`, `Proxy-Authorization`, and `WWW-Authenticate`; header values are truncated, and only the content-coded body hash and byte count are returned. Response decompression is disabled to keep the hash/length aligned with the body bytes represented by `Content-Length` when present.
+- Probe evidence omits sensitive authentication, cookie, token, credential, session, CSRF, and key headers and secret-shaped values; retained header values are bounded. Query values and fragments are redacted. Only the content-coded body hash and byte count are returned. Response decompression is disabled to keep the hash/length aligned with the body bytes represented by `Content-Length` when present.
 - The deterministic diff layer has no vulnerability, severity, or likelihood conclusions. Extra request headers are used for the probe only and are never copied into comparison evidence.
 - `Observation.hypothesis_id` is nullable so passive recon evidence can exist independently; verification evidence is linked to a hypothesis and inherits its asset ID from that hypothesis.
 - `gateway.lab_mode.pin_lab_url()` is a standalone manual lab-only escape hatch. It requires the explicit `allow_private_network=True` argument, still enforces URL authorization, and returns a `LabPinnedTarget` marked `is_lab_target=True`. Normal workers and verification modules must not import it.
@@ -272,7 +308,7 @@ The V6 first slice is a **supervised cycle**, not an autonomous loop: one explic
 - Generated hypotheses are suggestions for a human reviewer. `generate_hypotheses()` writes only the hardcoded `"unverified"` status, and the parser drops any `status`, `severity`, `confidence`, or `verified` line, so model output cannot promote its own claims. `prioritization` is fail-closed in the same spirit: anything not exactly `"unverified"` is excluded from ranking.
 - `verification.verdict_checker.check_verdict()` is the only interpretation layer and it is pure: it takes the stored observation mapping, recomputes the compared flags from the recorded numbers, and returns `inconclusive` whenever the data is thin, malformed, internally contradictory, or lacks a discriminating control. Recorded flags are never trusted, and no control claim can yield `supported`, so a pair that returns the same bytes can never be promoted as a control result.
 - The verification runner is gated four ways: it accepts only lab-marked targets via `probe_lab_target()`, it validates the entire plan before the first request, it authorizes and pins every target in the plan before the first request (so an out-of-scope target stops the run with no request sent), and it probes every control pair before it records any claim. A control that does not discriminate raises `SetupControlError` with nothing written. Request credentials are never stored, logged, or copied into evidence or reports.
-- Every `Verdict` row carries an integrity digest binding the judgement to the evidence row id, its canonical evidence content, the hypothesis id, and the two recorded target URLs. `store_verdict()` refuses to write a row that fails the same `verify_verdict()` check its consumers apply, so the writer and the verifier cannot drift apart. Editing a verdict field, its evidence, the recorded target, or rebinding the row to another observation or hypothesis invalidates it; a hand-written row cannot present a digest that re-derives from the bytes it cites.
+- Every `Verdict` row carries an integrity digest binding the judgement to the evidence row id, its canonical evidence content, the hypothesis id, and the two recorded target URLs. `store_verdict()` refuses to write a row that fails the same `verify_verdict()` check its consumers apply, so the writer and the verifier cannot drift apart. Retained evidence and verdict rows cannot be updated through the ORM or direct SQLite SQL; the verdict digest remains a separate check against tampering or unsupported database access. A hand-written row cannot present a digest that re-derives from the bytes it cites.
 - `verification.finding_promotion.promote_to_finding()` is the project's only writer of `Hypothesis.status` and its only creator of `Finding` rows; `tests/test_finding_promotion.py` asserts both properties across `verification/`, `intelligence/`, `gateway/`, and `data/`. Promotion requires a named human approver, refuses any refuted verdict, refuses any verdict that fails its integrity check, and records who, when, and what in `promotion_audit`.
 - `verification.investigation_lifecycle` is the project's only writer of `Investigation.status`; `tests/test_investigation_lifecycle.py` asserts this across `verification/`, `intelligence/`, `gateway/`, and `data/`. It writes nothing else, flushes without committing, and cannot import the gateway, call a model, or touch a `Hypothesis` or `Finding`.
 - `verification.investigation_tasks` is the project's only writer of `Task.status`, `Task.started_at`, and `Task.ended_at`; `tests/test_investigation_tasks.py` asserts this (and that the only `Investigation`/`Task` status writers are the two lifecycle modules) across `verification/`, `intelligence/`, `gateway/`, `data/`, `workers/`, and `scripts/`. An AST guard pins its imports to `datetime`, `sqlalchemy`, and the `Investigation`/`Task` models, so it cannot reach the gateway, a model, a transport, or the promotion gate.
@@ -297,3 +333,26 @@ The V3 tests are offline as well: they use in-memory SQLite and a fake or frozen
 ## Intelligence API Configuration
 
 `intelligence.llm_client` is API-only DeepSeek infrastructure and has exactly one caller in an investigation flow: `intelligence.hypothesis_generation.generate_hypotheses()`. It reads `DEEPSEEK_API_KEY` from the process environment; no other module imports it, and nothing calls it at import time, on a schedule, or in a loop. Provide the key through a local secret manager or environment configuration; never commit the key to this repository. Tokens are spent only when an operator deliberately runs generation, or by tests that mock the transport.
+
+## Mission 004: endpoint-inventory-driven investigation planning
+
+Missions 004–009 integrate the deterministic endpoint-inventory planner with the existing supervised cycle. Eligible stored endpoints are scope/host checked and turn into duplicate-safe research tasks with bounded budgets and valid dependencies. Dry-run preview is side-effect free; execution creates tasks, then dispatches only ready tasks. Passive DNS recon and the offline researcher brief are available through existing task dispatch. Hypothesis generation may use the configured LLM only when explicitly executed. Endpoint review, verification approval, and finding promotion remain human-controlled. Verification plans arrive through bounded stdin input, credentials are transient, and query strings/fragments are redacted from persisted diff evidence.
+
+The Juice Shop basket comparison remains a separate operator-run local-lab task. The pipeline has no autonomous scheduler, public-target verification mode, finding promotion, or report submission.
+
+`task_observations` records structured `input` and `output` links for task
+dispatch. Inventory and recon record produced observations; research briefs and
+hypothesis generation record observations they consume; verification records
+the observations it produces. Planner-created manual review tasks link the
+specific observation presented for review. SQLite rejects link updates and
+deletion, rejects cross-investigation links, and schema readiness validates the
+protection triggers. These links describe task execution context; they do not
+upgrade supporting observations into verified vulnerability evidence.
+
+Pre-existing observations are not assigned fabricated task links during
+migration. If no relationship can be established from recorded data, task
+provenance remains unknown rather than being inferred from a summary string.
+`observation_fingerprints` stores a deterministic digest of canonical evidence
+plus ownership/type context and an exact-duplicate pointer. A hash match is
+confirmed against canonical payload bytes; duplicate rows remain stored and
+auditable rather than being discarded.

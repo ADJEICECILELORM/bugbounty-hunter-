@@ -44,7 +44,7 @@ from collections.abc import Callable, Sequence
 
 from sqlalchemy.orm import Session
 
-from data.models import Observation
+from data.models import Asset, Observation
 from gateway.dns_pin import Resolver, URLAuthorizer
 from gateway.lab_mode import pin_lab_url
 from verification.endpoint_inventory import inventory_from_seeds
@@ -131,9 +131,22 @@ def collect_seed_inventory(
     production path, and it cannot be reached at all when ``authorize`` rejects
     every candidate.
     """
-    candidates = inventory_from_seeds(base_url, authorize)
+    asset = session.get(Asset, asset_id)
+    if asset is None:
+        raise LookupError(f"Asset {asset_id} does not exist")
+    candidates = inventory_from_seeds(
+        base_url, authorize, expected_hostname=asset.hostname
+    )
     if not candidates:
         return []
+
+    program = asset.investigation.program
+    provenance_snapshot = {
+        "target": asset.hostname,
+        "authorized_scope": list(program.authorized_scope),
+        "excluded_scope": list(program.excluded_scope),
+        "caller_authorizer_approved": True,
+    }
 
     probe = transport
     if probe is None:
@@ -152,5 +165,12 @@ def collect_seed_inventory(
             )
 
     return [
-        store_inventory_evidence(asset_id, probe(url), session) for url in candidates
+        store_inventory_evidence(
+            asset_id,
+            probe(url),
+            session,
+            provenance_collector="endpoint-inventory",
+            authorization_snapshot=provenance_snapshot,
+        )
+        for url in candidates
     ]

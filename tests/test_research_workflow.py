@@ -96,6 +96,7 @@ def test_brief_creates_unverified_candidate_with_support_and_provenance(
     assert brief.observations[0].http_status == 200
     assert brief.observations[0].content_length == 123
     assert brief.observations[0].body_sha256_prefix == "a" * 12
+    assert brief.observations[0].evidence_gaps == ()
 
     candidate = brief.candidates[0]
     assert candidate.category == "access_control_review"
@@ -113,6 +114,28 @@ def test_brief_creates_unverified_candidate_with_support_and_provenance(
         )
     ) is not None
     assert session.get(Hypothesis, candidate.hypothesis_id).status == "unverified"
+
+
+def test_brief_reports_missing_provenance_and_response_metadata() -> None:
+    engine = init_db("sqlite+pysqlite:///:memory:")
+    with Session(engine) as session:
+        asset = _seed_asset(session)
+        observation = Observation(
+            asset=asset,
+            observation_type="endpoint_inventory",
+            data={"url": "https://api.example.test/account", "status_code": 200},
+        )
+        session.add(observation)
+        session.flush()
+
+        brief = build_researcher_brief(asset.id, session)
+
+        assert brief.observations[0].evidence_gaps == (
+            "provenance_unrecorded",
+            "response_size_unrecorded",
+            "body_digest_unrecorded",
+        )
+    engine.dispose()
 
 
 def test_repeated_brief_is_idempotent_for_candidates_and_support_links(

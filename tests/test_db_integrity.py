@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import create_engine, delete, inspect, select, text
@@ -16,21 +17,33 @@ from data.db import (
     check_database_integrity,
     init_db,
 )
-from data.migrations import SQLITE_RETENTION_TRIGGERS, _install_sqlite_retention_triggers
+from data.migrations import (
+    SQLITE_IMMUTABILITY_TRIGGERS,
+    SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS,
+    SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS,
+    SQLITE_RETENTION_TRIGGERS,
+    SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+    SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+    SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+    _install_sqlite_retention_triggers,
+)
 from data.models import (
     Asset,
     Finding,
     HistoricalRecordIsImmutable,
     Hypothesis,
+    InvalidObservationError,
     HypothesisSupportingObservation,
     Investigation,
     Observation,
+    ObservationFingerprint,
     ObservationProvenance,
     Program,
     PromotionAudit,
     Task,
     TaskEvent,
     TaskEventIsAppendOnly,
+    TaskObservation,
     Verdict,
 )
 from data.sqlite import enable_sqlite_foreign_keys
@@ -84,6 +97,62 @@ def test_all_mapped_foreign_keys_restrict_parent_deletion() -> None:
                 continue
             for foreign_key in inspector.get_foreign_keys(table_name):
                 assert foreign_key["options"].get("ondelete") == "RESTRICT"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "observation_type,data",
+    [
+        ("dns_record", ["not", "an", "object"]),
+        ("dns_record", {"value": float("nan")}),
+        ("", {"record_type": "A", "value": "192.0.2.1"}),
+    ],
+)
+def test_new_observation_requires_well_formed_json_evidence(
+    observation_type: str, data: Any
+) -> None:
+    engine = init_db("sqlite+pysqlite:///:memory:")
+    try:
+        with Session(engine) as session:
+            program = Program(
+                name="Invalid observation test",
+                authorized_scope=["example.test"],
+                excluded_scope=[],
+                rate_limit=1,
+            )
+            investigation = Investigation(program=program, status="running")
+            asset = Asset(investigation=investigation, hostname="example.test")
+            session.add(asset)
+            session.flush()
+            session.add(
+                Observation(
+                    asset_id=asset.id,
+                    observation_type=observation_type,
+                    data=data,
+                )
+            )
+            with pytest.raises(InvalidObservationError):
+                session.flush()
+            session.rollback()
+    finally:
+        engine.dispose()
+
+
+def test_observation_rejects_non_string_nested_json_object_keys() -> None:
+    engine = init_db("sqlite+pysqlite:///:memory:")
+    try:
+        with Session(engine) as session:
+            program, investigation, asset, _, _ = _seed_records(session)
+            session.add(
+                Observation(
+                    asset=asset,
+                    observation_type="synthetic",
+                    data={"nested": {1: "not a stable JSON object key"}},
+                )
+            )
+            with pytest.raises(InvalidObservationError, match="every JSON object"):
+                session.flush()
     finally:
         engine.dispose()
 
@@ -326,6 +395,8 @@ _RETAINED_RECORDS = {
         HypothesisSupportingObservation,
         "id",
     ),
+    "task_observations": (TaskObservation, "id"),
+    "observation_fingerprints": (ObservationFingerprint, "observation_id"),
     "verdicts": (Verdict, "id"),
     "findings": (Finding, "id"),
     "task_events": (TaskEvent, "id"),
@@ -347,6 +418,21 @@ def _seed_standalone_record(session: Session, table_name: str) -> int:
         record = HypothesisSupportingObservation(
             hypothesis=hypothesis, observation=observation
         )
+    elif table_name == "task_observations":
+        task = Task(
+            investigation=investigation,
+            kind="research_brief",
+            title="Research evidence",
+        )
+        session.add(task)
+        session.flush()
+        record = TaskObservation(
+            task=task,
+            observation=observation,
+            role="input",
+        )
+    elif table_name == "observation_fingerprints":
+        record = session.get(ObservationFingerprint, observation.id)
     elif table_name == "verdicts":
         record = Verdict(
             hypothesis=hypothesis,
@@ -473,24 +559,44 @@ def test_fresh_database_installs_all_retention_triggers(tmp_path: Path) -> None:
                     "SELECT name, tbl_name FROM sqlite_master WHERE type='trigger'"
                 )
             }
-        assert triggers == SQLITE_RETENTION_TRIGGERS
+        assert triggers == {
+            **SQLITE_RETENTION_TRIGGERS,
+            **SQLITE_IMMUTABILITY_TRIGGERS,
+            **SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+            **SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+            **SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS,
+            **SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS,
+            "validate_task_observation_ownership": "task_observations",
+        }
     finally:
         engine.dispose()
 
 
-@pytest.mark.parametrize("database_name", ["lab_evidence.db", "lab_evidence_v3.db"])
-def test_legacy_copy_migration_installs_retention_triggers(
-    tmp_path: Path, database_name: str
+def test_synthetic_version_five_migration_installs_retention_triggers(
+    tmp_path: Path,
 ) -> None:
-    import shutil
-
     from data.migrations import migrate_database
 
-    source = Path(__file__).resolve().parent.parent / database_name
-    copied = tmp_path / database_name
-    shutil.copy2(source, copied)
-    engine = create_engine(f"sqlite+pysqlite:///{copied}")
+    engine = init_db(
+        f"sqlite+pysqlite:///{tmp_path / 'synthetic-v5-retention.db'}"
+    )
     try:
+        with engine.begin() as connection:
+            for trigger_name in (
+                *SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+                *SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+                *SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+                *SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS,
+                *SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS,
+            ):
+                connection.exec_driver_sql(
+                    f'DROP TRIGGER IF EXISTS "{trigger_name}"'
+                )
+            connection.exec_driver_sql("DROP TABLE observation_fingerprints")
+            connection.exec_driver_sql("DROP TABLE task_observations")
+            connection.exec_driver_sql(
+                "DELETE FROM schema_migrations WHERE version IN (6, 7, 8)"
+            )
         migrate_database(engine)
         with engine.connect() as connection:
             triggers = {
@@ -499,7 +605,15 @@ def test_legacy_copy_migration_installs_retention_triggers(
                     "SELECT name, tbl_name FROM sqlite_master WHERE type='trigger'"
                 )
             }
-        assert triggers == SQLITE_RETENTION_TRIGGERS
+        assert triggers == {
+            **SQLITE_RETENTION_TRIGGERS,
+            **SQLITE_IMMUTABILITY_TRIGGERS,
+            **SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS,
+            **SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS,
+            **SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS,
+            **SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS,
+            **SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS,
+        }
     finally:
         engine.dispose()
 
@@ -582,6 +696,46 @@ def test_integrity_check_detects_ineffective_trigger_without_repairing_it(
                 {"name": trigger_name},
             ).scalar_one()
             assert "WHEN 0" in trigger_sql
+    finally:
+        engine.dispose()
+
+
+def test_retained_records_reject_orm_and_sql_updates(tmp_path: Path) -> None:
+    engine = init_db(f"sqlite+pysqlite:///{tmp_path / 'immutable-records.db'}")
+    try:
+        with Session(engine) as session:
+            _, _, _, _, observation = _seed_records(session)
+            observation_id = observation.id
+            session.commit()
+
+        with Session(engine) as session:
+            observation = session.get(Observation, observation_id)
+            assert observation is not None
+            observation.data = {"record_type": "A", "value": "198.51.100.1"}
+            with pytest.raises(HistoricalRecordIsImmutable, match="cannot be updated"):
+                session.flush()
+            session.rollback()
+
+        with engine.begin() as connection:
+            with pytest.raises(IntegrityError, match="historical record immutability"):
+                connection.exec_driver_sql(
+                    "UPDATE observations SET data='{}' WHERE id=?",
+                    (observation_id,),
+                )
+    finally:
+        engine.dispose()
+
+
+def test_integrity_check_detects_missing_immutability_trigger(
+    tmp_path: Path,
+) -> None:
+    engine = init_db(f"sqlite+pysqlite:///{tmp_path / 'missing-immutable-trigger.db'}")
+    trigger_name = next(iter(SQLITE_IMMUTABILITY_TRIGGERS))
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f'DROP TRIGGER "{trigger_name}"')
+        with pytest.raises(DatabaseIntegrityError, match="immutability triggers"):
+            check_database_integrity(engine)
     finally:
         engine.dispose()
 

@@ -35,7 +35,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.db import open_ready_database  # noqa: E402
+from scripts.database_options import (  # noqa: E402
+    OperatorDatabaseError,
+    add_database_option,
+    open_operator_database,
+)
 from data.models import Investigation  # noqa: E402
 from verification.task_recovery import (  # noqa: E402
     create_retry_task,
@@ -79,6 +83,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REASON,
         help="reason recorded when --mark-failed is used",
     )
+    add_database_option(parser)
     return parser
 
 
@@ -89,14 +94,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.threshold_seconds < 0:
         parser.error("--threshold-seconds must be >= 0")
 
-    db_path = (REPO_ROOT / DB_NAME).resolve()
-    engine = open_ready_database(f"sqlite+pysqlite:///{db_path.as_posix()}")
+    try:
+        engine, db_path = open_operator_database(
+            args.database, default_path=REPO_ROOT / DB_NAME
+        )
+    except OperatorDatabaseError as error:
+        raise SystemExit(str(error)) from error
 
     with Session(engine) as session:
         investigation = session.get(Investigation, args.investigation_id)
         if investigation is None:
             raise SystemExit(
-                f"No Investigation #{args.investigation_id} exists in {DB_NAME}."
+                f"No Investigation #{args.investigation_id} exists in {db_path}."
             )
 
         if args.mark_failed is not None:

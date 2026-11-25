@@ -15,11 +15,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import orchestration.task_runner as runner
 from data.db import init_db
-from data.models import Asset, Hypothesis, Observation, Program
+from data.models import Asset, Hypothesis, Observation, Program, TaskObservation
 from verification.investigation_lifecycle import start_investigation
 from verification.investigation_tasks import (
     complete_task,
@@ -42,7 +43,7 @@ def session() -> Any:
 def investigation(session: Session):
     program = Program(
         name="Example Program",
-        authorized_scope=["*.example.test"],
+        authorized_scope=["example.test", "*.example.test"],
         excluded_scope=[],
         rate_limit=30,
     )
@@ -112,6 +113,67 @@ def test_inventory_task_dispatches_and_completes(
     ]
 
 
+def test_inventory_task_records_provenance_links(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset = seed_asset(session, investigation)
+    task = make_task(
+        session,
+        investigation,
+        kind="inventory",
+        params={"asset_id": asset.id, "base_url": "https://example.test/"},
+    )
+
+    def fake_collect(base_url, authorize, *, session, asset_id, allow_private_network=False, **kwargs):
+        observation = Observation(
+            asset_id=asset_id,
+            observation_type="endpoint_inventory",
+            data={"url": base_url, "status_code": 200},
+        )
+        session.add(observation)
+        session.flush()
+        return [observation]
+
+    monkeypatch.setattr(runner, "collect_seed_inventory", fake_collect)
+    runner.run_task(task.id, session, authorize=lambda url: True)
+
+    links = session.scalars(
+        select(TaskObservation).where(TaskObservation.task_id == task.id)
+    ).all()
+    assert len(links) == 1
+    assert links[0].role == "output"
+    assert session.get(Observation, links[0].observation_id) is not None
+
+
+def test_inventory_task_refuses_scope_removed_since_authorizer_creation(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset = seed_asset(session, investigation)
+    task = make_task(
+        session,
+        investigation,
+        kind="inventory",
+        params={"asset_id": asset.id, "base_url": "https://example.test/"},
+    )
+    called = []
+    monkeypatch.setattr(
+        runner,
+        "collect_seed_inventory",
+        lambda *args, **kwargs: called.append(True),
+    )
+    # This callback represents a CLI snapshot built before an operator narrows
+    # the program scope. The dispatcher must also consult the stored current scope.
+    investigation.program.authorized_scope = ["other.example.test"]
+    session.flush()
+
+    with pytest.raises(runner.TaskNotRunnable, match="no longer authorized"):
+        runner.run_task(task.id, session, authorize=lambda _url: True)
+
+    assert called == []
+    assert task.status == "pending"
+    assert [event.event_type for event in task.events] == ["created"]
+
+
 def test_hypothesis_generation_task_dispatches(
     session: Session, investigation, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -135,6 +197,65 @@ def test_hypothesis_generation_task_dispatches(
     assert task.status == "completed"
 
 
+def test_hypothesis_generation_records_input_observation_links(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset = seed_asset(session, investigation)
+    observation = Observation(
+        asset_id=asset.id,
+        observation_type="dns_record",
+        data={"record_type": "A", "value": "192.0.2.10"},
+    )
+    session.add(observation)
+    session.flush()
+    task = make_task(
+        session, investigation, kind="hypothesis_generation", params={"asset_id": asset.id}
+    )
+    monkeypatch.setattr(runner, "generate_hypotheses", lambda _asset_id, _session: [])
+
+    runner.run_task(task.id, session)
+
+    link = session.scalar(
+        select(TaskObservation).where(TaskObservation.task_id == task.id)
+    )
+    assert link is not None
+    assert (link.observation_id, link.role) == (observation.id, "input")
+
+
+def test_task_observation_link_rejects_cross_investigation_evidence(
+    session: Session, investigation
+) -> None:
+    asset = seed_asset(session, investigation)
+    task = make_task(
+        session,
+        investigation,
+        kind="research_brief",
+        params={"asset_id": asset.id},
+    )
+    other_investigation = start_investigation(investigation.program_id, session)
+    other_asset = seed_asset(
+        session, other_investigation, hostname="other.example.test"
+    )
+    observation = Observation(
+        asset_id=other_asset.id,
+        observation_type="dns_record",
+        data={"record_type": "A", "value": "192.0.2.1"},
+    )
+    session.add(observation)
+    session.flush()
+
+    with pytest.raises(ValueError, match="another investigation"):
+        runner.record_task_observation_links(
+            task,
+            session,
+            observation_ids=[observation.id],
+            role="input",
+        )
+    assert session.scalar(
+        select(TaskObservation.id).where(TaskObservation.task_id == task.id)
+    ) is None
+
+
 def test_verification_task_dispatches_with_operator_inputs(
     session: Session, investigation, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -148,16 +269,28 @@ def test_verification_task_dispatches_with_operator_inputs(
         id = 1
 
     class FakeOutcome:
-        verdict = FakeVerdict()
-
-    class FakeResult:
-        control_outcomes = ()
-        primary_outcomes = (FakeOutcome(),)
-        outcomes = primary_outcomes
+        def __init__(self, observation):
+            self.verdict = FakeVerdict()
+            self.observation = observation
 
     captured: dict[str, Any] = {}
 
     def fake_run(hypothesis_id, plan, *, allow_private_network, authorize, session, **kwargs):
+        observation = Observation(
+            asset_id=hypothesis.asset_id,
+            hypothesis_id=hypothesis_id,
+            observation_type="diff_check",
+            data={"probe_a": {}, "probe_b": {}},
+        )
+        session.add(observation)
+        session.flush()
+        outcome = FakeOutcome(observation)
+
+        class FakeResult:
+            control_outcomes = ()
+            primary_outcomes = (outcome,)
+            outcomes = primary_outcomes
+
         captured.update(
             hypothesis_id=hypothesis_id,
             plan=plan,
@@ -168,15 +301,32 @@ def test_verification_task_dispatches_with_operator_inputs(
 
     monkeypatch.setattr(runner, "run_hypothesis_verification", fake_run)
     authorize = lambda url: True  # noqa: E731
-    plan = object()
+    plan = type("BoundPlan", (), {"hypothesis_id": hypothesis.id})()
 
-    runner.run_task(task.id, session, authorize=authorize, verification_plan=plan)
+    runner.run_task(
+        task.id,
+        session,
+        authorize=authorize,
+        allow_private_network=True,
+        verification_plan=plan,
+        approve_verification=True,
+    )
 
     assert task.status == "completed"
     assert captured["hypothesis_id"] == hypothesis.id
     assert captured["plan"] is plan
-    assert captured["authorize"] is authorize
-    assert captured["allow_private_network"] is False
+    assert captured["authorize"] is not authorize
+    assert captured["authorize"]("https://example.test/") is True
+    assert captured["authorize"]("https://outside.invalid/") is False
+    assert captured["allow_private_network"] is True
+    link = session.scalar(
+        select(TaskObservation).where(TaskObservation.task_id == task.id)
+    )
+    assert link is not None
+    assert (link.observation_id, link.role) == (
+        session.scalar(select(Observation.id).where(Observation.hypothesis_id == hypothesis.id)),
+        "output",
+    )
 
 
 def test_unmet_dependency_refuses_before_running(
@@ -303,13 +453,133 @@ def test_missing_verification_plan_refuses(session: Session, investigation) -> N
     assert task.status == "pending"
 
 
+def test_verification_plan_alone_is_not_an_execution_approval(
+    session: Session,
+    investigation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = seed_asset(session, investigation)
+    hypothesis = seed_hypothesis(session, asset)
+    task = make_task(
+        session, investigation, kind="verification", params={"hypothesis_id": hypothesis.id}
+    )
+    called: list[bool] = []
+    monkeypatch.setattr(runner, "run_hypothesis_verification", lambda *a, **k: called.append(True))
+
+    with pytest.raises(runner.TaskNotRunnable, match="explicit approve_verification"):
+        runner.run_task(
+            task.id,
+            session,
+            authorize=lambda _url: True,
+            verification_plan=type(
+                "BoundPlan", (), {"hypothesis_id": hypothesis.id}
+            )(),
+        )
+
+    assert task.status == "pending"
+    assert called == []
+
+
 def test_non_dispatchable_kind_refuses(session: Session, investigation) -> None:
-    task = make_task(session, investigation, kind="recon")
+    task = make_task(session, investigation, kind="hypothesis_review")
 
     with pytest.raises(runner.TaskNotRunnable, match="no dispatcher"):
         runner.run_task(task.id, session)
 
     assert task.status == "pending"
+
+
+def test_recon_task_dispatches_only_after_operator_authorization(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset = seed_asset(session, investigation, hostname="api.example.test")
+    task = make_task(session, investigation, kind="recon")
+    calls: list[str] = []
+
+    def fake_discover(hostname, policy, rate_limiter):
+        calls.append(hostname)
+        return [
+            {"type": "dns_record", "record_type": "A", "value": "203.0.113.10"}
+        ]
+
+    monkeypatch.setattr(runner, "passive_discover", fake_discover)
+
+    runner.run_task(task.id, session, authorize=lambda _url: True)
+
+    assert calls == [asset.hostname]
+    assert task.status == "completed"
+    observation = session.query(Observation).filter_by(asset_id=asset.id).one()
+    link = session.scalar(
+        select(TaskObservation).where(TaskObservation.task_id == task.id)
+    )
+    assert link is not None
+    assert (link.observation_id, link.role) == (observation.id, "output")
+
+
+def test_recon_skips_targets_rejected_by_operator_scope_before_dns(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_asset(session, investigation)
+    task = make_task(session, investigation, kind="recon")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "passive_discover",
+        lambda *args: calls.append("called") or [],
+    )
+
+    with pytest.raises(runner.TaskNotRunnable, match="no asset currently authorized"):
+        runner.run_task(task.id, session, authorize=lambda _url: False)
+
+    assert calls == []
+    assert task.status == "pending"
+
+
+def test_research_brief_task_dispatch_is_idempotent_for_repeated_evidence(
+    session: Session, investigation
+) -> None:
+    asset = seed_asset(session, investigation, hostname="api.example.test")
+    observation = Observation(
+        asset_id=asset.id,
+        observation_type="endpoint_inventory",
+        data={"url": "https://api.example.test/account", "status_code": 200},
+    )
+    session.add(observation)
+    session.flush()
+    first = make_task(
+        session,
+        investigation,
+        kind="research_brief",
+        params={"asset_id": asset.id},
+    )
+    second = make_task(
+        session,
+        investigation,
+        kind="research_brief",
+        title="Repeat offline brief",
+        params={"asset_id": asset.id},
+    )
+
+    runner.run_task(first.id, session)
+    runner.run_task(second.id, session)
+
+    from data.models import Hypothesis, HypothesisSupportingObservation
+
+    assert first.status == second.status == "completed"
+    assert session.query(Hypothesis).filter_by(asset_id=asset.id).count() == 1
+    assert (
+        session.query(HypothesisSupportingObservation)
+        .filter_by(observation_id=observation.id)
+        .count()
+        == 1
+    )
+    for task in (first, second):
+        links = session.scalars(
+            select(TaskObservation).where(TaskObservation.task_id == task.id)
+        ).all()
+        assert [(link.observation_id, link.role) for link in links] == [
+            (observation.id, "input")
+        ]
 
 
 def test_run_task_rejects_a_missing_task(session: Session) -> None:
@@ -346,14 +616,21 @@ def test_orchestration_never_assigns_hypothesis_status_or_promotes() -> None:
         assert "promote_to_finding" not in source
 
 
-def test_orchestration_never_commits_or_writes_statuses_directly() -> None:
-    sources = [path.read_text(encoding="utf-8") for path in ORCHESTRATION_DIR.glob("*.py")]
-    assert sources, "expected orchestration sources to scan"
+def test_only_explicit_task_runner_mode_commits_before_dispatch() -> None:
+    paths = list(ORCHESTRATION_DIR.glob("*.py"))
+    assert paths, "expected orchestration sources to scan"
 
-    for source in sources:
-        assert ".commit(" not in source
+    committers = {
+        path.name
+        for path in paths
+        if ".commit(" in path.read_text(encoding="utf-8")
+    }
+    assert committers == {"task_runner.py"}
+    runner_source = (ORCHESTRATION_DIR / "task_runner.py").read_text(encoding="utf-8")
+    assert "if commit_before_dispatch:" in runner_source
+    assert "session.commit()" in runner_source
+
+    for source in (path.read_text(encoding="utf-8") for path in paths):
         assert re.search(r"\btask\.(status|started_at|ended_at)\s*=(?!=)", source) is None
         assert re.search(r"investigation\.status\s*=(?!=)", source) is None
         assert "from gateway.lab_mode" not in source
-
-

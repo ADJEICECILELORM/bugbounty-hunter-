@@ -22,8 +22,10 @@ calls them owns the transaction.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import re
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from data.models import Investigation, Task, TaskEvent
@@ -35,6 +37,11 @@ from verification.investigation_tasks import (
 )
 
 RETRYABLE_STATUSES = frozenset({"failed", "cancelled"})
+_SENSITIVE_REASON = re.compile(
+    r"(?i)(?:\b(?:password|passwd|secret|token|api[_-]?key|authorization|cookie)\b\s*[:=]|"
+    r"\bbearer\s+\S+|https?://[^/\s:@]+:[^/@\s]+@)"
+)
+MAX_RECOVERY_REASON_CHARS = 500
 
 
 def find_stuck_tasks(
@@ -78,16 +85,27 @@ def mark_task_failed_after_crash(task_id: int, session: Session, *, reason: str)
     exactly like any other invalid completion, then appends a
     ``crash_recovery`` event carrying the reason. Flush only; never commits.
     """
-    if not reason.strip():
-        raise ValueError("reason must not be blank")
+    if (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or len(reason) > MAX_RECOVERY_REASON_CHARS
+        or any(ord(character) < 32 and character not in "\t\n" for character in reason)
+        or _SENSITIVE_REASON.search(reason)
+    ):
+        raise ValueError(
+            "reason must be a short, non-sensitive description without credentials"
+        )
 
-    task = complete_task(task_id, session, final_status="failed", result_summary=reason)
-    append_task_event(
-        task.id,
-        session,
-        event_type="crash_recovery",
-        detail={"reason": reason},
-    )
+    with session.begin_nested():
+        task = complete_task(
+            task_id, session, final_status="failed", result_summary=reason
+        )
+        append_task_event(
+            task.id,
+            session,
+            event_type="crash_recovery",
+            detail={"reason": reason},
+        )
     return task
 
 
@@ -101,7 +119,17 @@ def create_retry_task(original_task_id: int, session: Session) -> Task:
     and the per-investigation cap stay single-sourced. The link back to the
     original is a ``retry_created`` event on the original. Flush only.
     """
-    original = session.get(Task, original_task_id)
+    connection = session.connection()
+    if connection.dialect.name == "sqlite":
+        driver_connection = connection.connection.driver_connection
+        if not driver_connection.in_transaction:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+    original = session.scalar(
+        select(Task)
+        .where(Task.id == original_task_id)
+        .with_for_update()
+    )
     if original is None:
         raise LookupError(f"Task {original_task_id} does not exist")
 
@@ -120,18 +148,23 @@ def create_retry_task(original_task_id: int, session: Session) -> Task:
     if already_retried is not None:
         raise ValueError(f"Task {original.id} already has a retry")
 
-    retry = create_task(
-        original.investigation_id,
-        session,
-        kind=original.kind,
-        title=original.title,
-        params=original.params,
-        depends_on=original.depends_on,
-    )
-    append_task_event(
-        original.id,
-        session,
-        event_type="retry_created",
-        detail={"retry_task_id": retry.id, "retry_of": original.id},
-    )
+    try:
+        with session.begin_nested():
+            retry = create_task(
+                original.investigation_id,
+                session,
+                kind=original.kind,
+                title=original.title,
+                params=original.params,
+                depends_on=original.depends_on,
+                dedupe_key=f"retry:v1:{original.id}",
+            )
+            append_task_event(
+                original.id,
+                session,
+                event_type="retry_created",
+                detail={"retry_task_id": retry.id, "retry_of": original.id},
+            )
+    except IntegrityError:
+        raise ValueError(f"Task {original.id} already has a retry") from None
     return retry

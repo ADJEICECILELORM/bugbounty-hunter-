@@ -24,7 +24,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -43,7 +42,11 @@ from orchestration.status_board import (  # noqa: E402
     get_researcher_dashboard,
     list_investigations,
 )
-from data.sqlite import enable_sqlite_foreign_keys  # noqa: E402
+from scripts.database_options import (  # noqa: E402
+    OperatorDatabaseError,
+    add_database_option,
+    open_operator_database_readonly,
+)
 
 DB_NAME = "lab_evidence_v3.db"
 DB_PATH = REPO_ROOT / DB_NAME
@@ -51,13 +54,11 @@ DB_PATH = REPO_ROOT / DB_NAME
 
 def read_only_engine(db_path: Path) -> Engine:
     """Open ``db_path`` read-only; refuse to run if the file is absent."""
-    if not db_path.is_file():
-        raise SystemExit(
-            f"{DB_NAME} does not exist. Run an investigation flow first, then "
-            "re-run this script; it only reads an existing database."
-        )
-    uri = f"sqlite:///file:{db_path.resolve().as_posix()}?mode=ro&uri=true"
-    return enable_sqlite_foreign_keys(create_engine(uri))
+    try:
+        engine, _ = open_operator_database_readonly(db_path, default_path=db_path)
+    except OperatorDatabaseError as error:
+        raise SystemExit(str(error)) from error
+    return engine
 
 
 def _format_timestamp(value: datetime | None) -> str:
@@ -100,6 +101,16 @@ def _print_board(board: InvestigationStatus, threshold_seconds: float) -> None:
         f"  budget remaining: tasks={board.budget.tasks_remaining} "
         f"llm_calls={board.budget.llm_calls_remaining}"
     )
+    exhausted = []
+    if board.budget.tasks_remaining <= 0:
+        exhausted.append("tasks")
+    if board.budget.llm_calls_remaining <= 0:
+        exhausted.append("llm_calls")
+    if exhausted:
+        print(
+            f"  budget exhausted: {' and '.join(exhausted)} — no further planning "
+            "or LLM calls will be allowed until the budget is raised"
+        )
     print(f"  hypotheses: {board.hypothesis_counts or {}}")
     print(f"  findings: {board.findings}")
     print(f"  tasks ({len(board.tasks)}):")
@@ -224,6 +235,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show stored observations and evidence-linked hypotheses "
         "(requires --investigation; read-only)",
     )
+    add_database_option(parser)
     return parser
 
 
@@ -236,7 +248,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.researcher_dashboard and args.investigation is None:
         raise SystemExit("--researcher-dashboard requires --investigation.")
 
-    engine = read_only_engine(DB_PATH)
+    selected_path = args.database or DB_PATH
+    engine = read_only_engine(selected_path)
     try:
         with Session(engine) as session:
             if args.researcher_dashboard:
@@ -256,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     except LookupError as error:
         raise SystemExit(str(error)) from error
     except OperationalError as error:
-        raise SystemExit(f"Could not read {DB_NAME}: {error}") from error
+        raise SystemExit(f"Could not read {selected_path}: {error}") from error
     finally:
         engine.dispose()
 

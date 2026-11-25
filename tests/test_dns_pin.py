@@ -1,8 +1,9 @@
 import ipaddress
+import socket
 
 import pytest
 
-from gateway.dns_pin import TargetRejected, pin_url, validate_redirect
+from gateway.dns_pin import TargetRejected, is_public_unicast, pin_url, validate_redirect
 
 
 def test_pin_url_authorizes_and_returns_resolved_addresses() -> None:
@@ -99,7 +100,13 @@ def test_pin_url_rejects_unsafe_url_forms(url: str) -> None:
         ["169.254.169.254"],  # cloud metadata
         ["100.64.0.1"],  # carrier-grade NAT
         ["0.0.0.0"],
+        ["224.0.0.1"],  # IPv4 multicast
+        ["239.255.255.250"],  # IPv4 multicast (SSDP)
+        ["ff02::1"],  # IPv6 multicast
+        ["2001:20::1"],  # ORCHIDv2 (non-routable)
         ["93.184.216.34", "::1"],  # one private answer rejects the whole target
+        ["93.184.216.34", "224.0.0.1"],  # one multicast answer rejects the target
+        ["2606:2800:220:1:248:1893:25c8:1946", "ff02::1"],  # mixed public + IPv6 multicast
     ],
 )
 def test_pin_url_rejects_every_non_public_answer(answers: list[str]) -> None:
@@ -131,6 +138,63 @@ def test_pin_url_rejects_unusable_resolver_answers(answers: list[str]) -> None:
             authorize=lambda _: True,
             resolver=lambda _host, _port, answers=answers: answers,
         )
+@pytest.mark.parametrize(
+    "address",
+    [
+        "224.0.0.1",  # IPv4 multicast
+        "239.255.255.250",  # IPv4 multicast (SSDP)
+        "ff02::1",  # IPv6 multicast
+        "2001:20::1",  # ORCHIDv2 (non-routable)
+        "0.0.0.0",  # IPv4 unspecified
+        "::",  # IPv6 unspecified
+        "::1",  # IPv6 loopback
+        "127.0.0.1",  # IPv4 loopback
+        "10.0.0.1",  # IPv4 private
+        "192.168.1.1",  # IPv4 private
+        "169.254.169.254",  # IPv4 link-local / cloud metadata
+        "fe80::1",  # IPv6 link-local
+        "fc00::1",  # IPv6 unique-local
+        "240.0.0.1",  # IPv4 reserved
+        "::ffff:127.0.0.1",  # IPv4-mapped loopback
+        "::ffff:10.0.0.1",  # IPv4-mapped private
+    ],
+)
+def test_is_public_unicast_rejects_special_purpose_addresses(address: str) -> None:
+    assert not is_public_unicast(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "93.184.216.34",  # public IPv4
+        "8.8.8.8",  # public IPv4
+        "2606:2800:220:1:248:1893:25c8:1946",  # public IPv6
+    ],
+)
+def test_is_public_unicast_accepts_public_addresses(address: str) -> None:
+    assert is_public_unicast(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("resolver temporarily unavailable"),
+        socket.gaierror(socket.EAI_NONAME, "no address associated with hostname"),
+    ],
+)
+def test_pin_url_fails_closed_when_the_resolver_raises(error: Exception) -> None:
+    def resolver(_host: str, _port: int) -> list[str]:
+        raise error
+
+    with pytest.raises(TargetRejected, match="could not be safely resolved"):
+        pin_url(
+            "https://example.com",
+            authorize=lambda _: True,
+            resolver=resolver,
+        )
+
+
+
 
 
 def test_pin_url_authorizes_before_it_resolves() -> None:

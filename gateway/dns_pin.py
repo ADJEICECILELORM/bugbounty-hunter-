@@ -12,6 +12,43 @@ IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 Resolver = Callable[[str, int], Iterable[str | IPAddress]]
 URLAuthorizer = Callable[[str], bool]
 
+_ORCHIDV2_NETWORK = ipaddress.ip_network("2001:20::/28")
+
+
+def is_public_unicast(address: IPAddress) -> bool:
+    """Return whether ``address`` is a globally routable, non-special unicast IP.
+
+    ``ipaddress``'s ``is_global`` alone is insufficient on Python 3.14: it
+    returns ``True`` for IPv4/IPv6 multicast (224.0.0.0/4 and ff00::/8) and for
+    the non-routable ORCHIDv2 range (2001:20::/28). This predicate layers the
+    explicit special-address checks on top of ``is_global`` so the public-target
+    policy rejects every special-purpose or non-unicast answer while continuing
+    to accept ordinary public IPv4 and IPv6 unicast addresses.
+
+    It deliberately does not define lab policy: private, loopback, and
+    link-local addresses are rejected here, and lab mode remains a separate,
+    explicitly authorized path (:func:`gateway.lab_mode.pin_lab_url`).
+    """
+    if address.is_multicast:
+        return False
+    if address.is_unspecified:
+        return False
+    if address.is_reserved:
+        return False
+    if address.is_private:
+        return False
+    if address.is_loopback:
+        return False
+    if address.is_link_local:
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            return is_public_unicast(mapped)
+        if address in _ORCHIDV2_NETWORK:
+            return False
+    return bool(address.is_global)
+
 
 class TargetRejected(ValueError):
     """Raised when a URL or one of its resolved addresses is not permitted."""
@@ -120,7 +157,7 @@ def pin_url(
 
     if not addresses:
         raise TargetRejected("Hostname resolved to no addresses")
-    if any(not address.is_global for address in addresses):
+    if any(not is_public_unicast(address) for address in addresses):
         raise TargetRejected("Hostname resolved to a non-public address")
 
     return PinnedTarget(normalized_url, hostname, port, addresses)

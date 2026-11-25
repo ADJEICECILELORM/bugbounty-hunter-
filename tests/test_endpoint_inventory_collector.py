@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from data.db import init_db
-from data.models import Asset, Investigation, Observation, Program
+from data.models import Asset, Investigation, Observation, ObservationProvenance, Program
 from gateway.dns_pin import TargetRejected
 from gateway.lab_mode import pin_lab_url as real_pin_lab_url
 from verification import endpoint_inventory_collector as collector
@@ -204,6 +204,28 @@ def test_only_approved_candidates_are_probed_in_seed_order(session: Session) -> 
     assert [observation.data["url"] for observation in stored] == approved
 
 
+def test_asset_host_mismatch_is_rejected_before_authorization_or_probe(
+    session: Session,
+) -> None:
+    asset = seed_asset(session)
+    candidates = seed_paths("http://198.51.100.10")
+    authorize = RecordingAuthorizer(set(candidates))
+    transport = RecordingTransport()
+
+    with pytest.raises(ValueError, match="does not match the asset host"):
+        collect_seed_inventory(
+            "http://198.51.100.10",
+            authorize,
+            session=session,
+            asset_id=asset.id,
+            transport=transport,
+        )
+
+    assert authorize.seen == []
+    assert transport.calls == []
+    assert session.scalars(select(Observation)).all() == []
+
+
 def test_a_probe_is_stored_as_asset_level_inventory_context(session: Session) -> None:
     asset = seed_asset(session)
     candidates = seed_paths(BASE)
@@ -223,6 +245,17 @@ def test_a_probe_is_stored_as_asset_level_inventory_context(session: Session) ->
     assert observation.asset_id == asset.id
     assert observation.hypothesis_id is None
     assert observation.data["url"] == candidates[1]
+    provenance = session.get(ObservationProvenance, observation.id)
+    assert provenance is not None
+    assert provenance.collector == "endpoint-inventory"
+    assert provenance.authorization_program_id == asset.investigation.program_id
+    assert provenance.captured_at is not None
+    assert provenance.authorization_snapshot == {
+        "target": asset.hostname,
+        "authorized_scope": ["127.0.0.1"],
+        "excluded_scope": [],
+        "caller_authorizer_approved": True,
+    }
     assert set(observation.data) == {
         "url",
         "status_code",
@@ -437,4 +470,3 @@ def test_the_collector_exposes_exactly_this_entry_point() -> None:
         "collect_seed_inventory",
     ]
     assert len(SEED_PATHS) == 9
-

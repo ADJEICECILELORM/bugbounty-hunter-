@@ -28,11 +28,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from sqlalchemy.orm import Session
 
 from data.models import Hypothesis, Observation, Verdict
-from gateway.dns_pin import Resolver, URLAuthorizer
+from gateway.dns_pin import Resolver, TargetRejected, URLAuthorizer
 from gateway.lab_mode import (
     LabModeNotExplicitlyEnabled,
     LabPinnedTarget,
@@ -76,9 +77,12 @@ class RequestPair:
 
 @dataclass(frozen=True)
 class VerificationTestPlan:
-    """The pairs to run: at least one control pair and at least one claim pair."""
+    """Control/claim pairs, optionally bound to one hypothesis id."""
 
     pairs: tuple[RequestPair, ...]
+    # Optional for direct legacy callers; supervised task dispatch requires it
+    # and checks that it matches the task's hypothesis before any network path.
+    hypothesis_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -274,8 +278,25 @@ def run_hypothesis_verification(
     hypothesis = session.get(Hypothesis, hypothesis_id)
     if hypothesis is None:
         raise LookupError(f"Hypothesis with id {hypothesis_id} does not exist")
+    if plan.hypothesis_id is not None and plan.hypothesis_id != hypothesis_id:
+        raise InvalidTestPlan(
+            "verification plan is bound to a different hypothesis"
+        )
 
     pairs = list(plan.pairs)
+    asset_hostname = hypothesis.asset.hostname.rstrip(".").lower()
+    try:
+        plan_hostnames = {
+            (urlsplit(url).hostname or "").rstrip(".").lower()
+            for pair in pairs
+            for url in (pair.url_a, pair.url_b)
+        }
+    except ValueError:
+        raise InvalidTestPlan("verification plan contains a malformed URL") from None
+    if not plan_hostnames or plan_hostnames != {asset_hostname}:
+        raise TargetRejected(
+            "verification plan targets must match the hypothesis asset host"
+        )
     pinned = _pin_targets(
         pairs,
         allow_private_network=allow_private_network,
@@ -307,9 +328,23 @@ def run_hypothesis_verification(
         measured[index] = _measure(pair, pinned, **transport)
 
     outcomes: list[PairOutcome] = []
+    program = hypothesis.asset.investigation.program
+    provenance_snapshot = {
+        "target": hypothesis.asset.hostname,
+        "authorized_scope": list(program.authorized_scope),
+        "excluded_scope": list(program.excluded_scope),
+        "caller_authorizer_approved": True,
+        "lab_mode": True,
+    }
     for index, pair in enumerate(pairs):
         diff, result = measured[index]
-        observation = store_diff_evidence(hypothesis.id, diff, session)
+        observation = store_diff_evidence(
+            hypothesis.id,
+            diff,
+            session,
+            provenance_collector="lab-verifier",
+            authorization_snapshot=provenance_snapshot,
+        )
         verdict = store_verdict(hypothesis.id, observation, result, session)
         outcomes.append(PairOutcome(pair, observation, result, verdict))
 

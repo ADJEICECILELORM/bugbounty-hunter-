@@ -304,4 +304,3 @@ def test_lab_start_command_keeps_the_target_on_loopback() -> None:
     assert "bkimminich/juice-shop" in LAB_START_COMMAND
     assert "-p 127.0.0.1:3000:3000" in LAB_START_COMMAND
     assert "0.0.0.0" not in LAB_START_COMMAND
-

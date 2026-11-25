@@ -42,6 +42,7 @@ class ObservationCard:
     http_status: int | None
     content_length: int | None
     body_sha256_prefix: str | None
+    evidence_gaps: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,13 @@ def _observation_card(
         and all(character in "0123456789abcdefABCDEF" for character in digest)
         else None
     )
+    gaps: list[str] = []
+    if provenance is None or not provenance.collector or provenance.captured_at is None:
+        gaps.append("provenance_unrecorded")
+    if status is not None and content_length is None:
+        gaps.append("response_size_unrecorded")
+    if status is not None and digest_prefix is None:
+        gaps.append("body_digest_unrecorded")
     return ObservationCard(
         observation_id=observation.id,
         observation_type=observation_type,
@@ -152,6 +160,7 @@ def _observation_card(
         http_status=status,
         content_length=content_length,
         body_sha256_prefix=digest_prefix,
+        evidence_gaps=tuple(gaps),
     )
 
 

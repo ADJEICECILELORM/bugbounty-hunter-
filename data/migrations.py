@@ -31,7 +31,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
-from data.models import Base
+from data.models import (
+    Base,
+    Observation,
+    ObservationFingerprint,
+    canonical_observation_identity,
+    observation_identity_fingerprint,
+)
 
 _MIGRATION_TABLE_NAME = "schema_migrations"
 _POSTGRES_MIGRATION_LOCK_ID = 814_208_001
@@ -64,6 +70,23 @@ _TABLES_ADDED_IN_V2 = (
     "hypothesis_supporting_observations",
     "observation_provenance",
 )
+_TABLES_ADDED_IN_V6 = ("task_observations",)
+_TABLES_ADDED_IN_V7 = ("observation_fingerprints",)
+SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS = {
+    "retain_task_observations": "task_observations",
+}
+SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS = {
+    "immutable_task_observations": "task_observations",
+}
+SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS = {
+    "retain_observation_fingerprints": "observation_fingerprints",
+}
+SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS = {
+    "immutable_observation_fingerprints": "observation_fingerprints",
+}
+SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS = {
+    "validate_task_observation_ownership": "task_observations",
+}
 SQLITE_RETENTION_TRIGGERS = {
     "retain_observations": "observations",
     "retain_observation_provenance": "observation_provenance",
@@ -77,6 +100,20 @@ SQLITE_RETENTION_TRIGGERS = {
 }
 SQLITE_RETENTION_ERROR_MESSAGE = (
     "historical record retention: permanent deletion is prohibited"
+)
+SQLITE_IMMUTABILITY_TRIGGERS = {
+    "immutable_observations": "observations",
+    "immutable_observation_provenance": "observation_provenance",
+    "immutable_hypothesis_supporting_observations": (
+        "hypothesis_supporting_observations"
+    ),
+    "immutable_verdicts": "verdicts",
+    "immutable_findings": "findings",
+    "immutable_task_events": "task_events",
+    "immutable_promotion_audit": "promotion_audit",
+}
+SQLITE_IMMUTABILITY_ERROR_MESSAGE = (
+    "historical record immutability: updates are prohibited"
 )
 
 
@@ -160,6 +197,7 @@ def _validate_table_contract(
     table: Table,
     *,
     include_columns: set[str] | None = None,
+    exclude_unique_indexes: set[str] | None = None,
 ) -> None:
     inspector = inspect(connection)
     table_name = table.name
@@ -272,9 +310,11 @@ def _validate_table_contract(
             f"{sorted(expected_checks - actual_checks)!r}"
         )
 
+    exclude_unique_indexes = exclude_unique_indexes or set()
     expected_indexes = {
         (tuple(column.name for column in index.columns), bool(index.unique))
         for index in table.indexes
+        if index.name not in exclude_unique_indexes
     }
     actual_indexes = {
         (tuple(index.get("column_names") or ()), bool(index.get("unique")))
@@ -294,6 +334,10 @@ def _validate_schema_contract(connection: Connection, version: int) -> None:
     required_tables = set(_LEGACY_CORE_COLUMNS)
     if version >= 2:
         required_tables.update(_TABLES_ADDED_IN_V2)
+    if version >= 6:
+        required_tables.update(_TABLES_ADDED_IN_V6)
+    if version >= 7:
+        required_tables.update(_TABLES_ADDED_IN_V7)
     missing_tables = sorted(required_tables - present_tables)
     if missing_tables:
         raise MigrationError(
@@ -304,6 +348,17 @@ def _validate_schema_contract(connection: Connection, version: int) -> None:
     for table_name in present_tables - {_MIGRATION_TABLE_NAME}:
         if table_name not in Base.metadata.tables:
             continue
+        if table_name == "programs" and version < 8:
+            table = Base.metadata.tables[table_name]
+            legacy_program_columns = {
+                column.name for column in table.columns
+            } - {"required_request_headers"}
+            _validate_table_contract(
+                connection,
+                table,
+                include_columns=legacy_program_columns,
+            )
+            continue
         if version == 0 and table_name == "investigations":
             _validate_table_contract(
                 connection,
@@ -312,18 +367,41 @@ def _validate_schema_contract(connection: Connection, version: int) -> None:
             )
             continue
         elif version == 0 and table_name in _TABLES_ADDED_IN_V2:
-            _validate_table_contract(connection, Base.metadata.tables[table_name])
+            table = Base.metadata.tables[table_name]
+            if table_name == "tasks":
+                legacy_task_columns = {column.name for column in table.columns} - {
+                    "dedupe_key"
+                }
+                _validate_table_contract(
+                    connection, table, include_columns=legacy_task_columns,
+                    exclude_unique_indexes={"uq_tasks_dedupe_key"},
+                )
+            else:
+                _validate_table_contract(connection, table)
             continue
         else:
             expected_table = Base.metadata.tables.get(table_name)
         if expected_table is not None:
-            _validate_table_contract(connection, expected_table)
+            if table_name == "tasks" and version < 4:
+                legacy_task_columns = {column.name for column in expected_table.columns} - {
+                    "dedupe_key"
+                }
+                _validate_table_contract(
+                    connection, expected_table, include_columns=legacy_task_columns,
+                    exclude_unique_indexes={"uq_tasks_dedupe_key"},
+                )
+            else:
+                _validate_table_contract(connection, expected_table)
 
     if inspector.has_table(_MIGRATION_TABLE_NAME):
         _validate_table_contract(connection, _schema_migrations)
 
     if version >= 3 and connection.dialect.name == "sqlite":
         _validate_sqlite_retention_triggers(connection)
+    if version >= 5 and connection.dialect.name == "sqlite":
+        _validate_sqlite_immutability_triggers(connection)
+    if version >= 6 and connection.dialect.name == "sqlite":
+        _validate_sqlite_task_observation_triggers(connection, version)
 
 
 def _validate_sqlite_retention_triggers(connection: Connection) -> None:
@@ -354,6 +432,142 @@ def _validate_sqlite_retention_triggers(connection: Connection) -> None:
         if invalid:
             details.append("invalid: " + ", ".join(sorted(invalid)))
         raise MigrationError("SQLite retention triggers are invalid (" + "; ".join(details) + ")")
+
+
+def _validate_sqlite_immutability_triggers(connection: Connection) -> None:
+    triggers = {
+        name: (table_name, sql or "")
+        for name, table_name, sql in connection.exec_driver_sql(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='trigger'"
+        )
+    }
+    missing = []
+    invalid = []
+    for trigger_name, table_name in SQLITE_IMMUTABILITY_TRIGGERS.items():
+        trigger = triggers.get(trigger_name)
+        if trigger is None:
+            missing.append(trigger_name)
+            continue
+        actual_table, sql = trigger
+        expected = (
+            f"CREATE TRIGGER {trigger_name} BEFORE UPDATE ON {table_name} "
+            f"BEGIN SELECT RAISE(ABORT, "
+            f"'{SQLITE_IMMUTABILITY_ERROR_MESSAGE}'); END"
+        )
+        if actual_table != table_name or _normalize_sql(sql) != _normalize_sql(expected):
+            invalid.append(trigger_name)
+    if missing or invalid:
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(sorted(missing)))
+        if invalid:
+            details.append("invalid: " + ", ".join(sorted(invalid)))
+        raise MigrationError(
+            "SQLite evidence immutability triggers are invalid ("
+            + "; ".join(details)
+            + ")"
+        )
+
+
+def _validate_sqlite_task_observation_triggers(
+    connection: Connection, version: int | None = None
+) -> None:
+    if version is None:
+        version = LATEST_SCHEMA_VERSION
+    triggers = {
+        name: (table_name, sql or "")
+        for name, table_name, sql in connection.exec_driver_sql(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='trigger'"
+        )
+    }
+    expected_triggers = {
+        **{
+            name: (
+                table_name,
+                f"CREATE TRIGGER {name} BEFORE DELETE ON {table_name} "
+                f"BEGIN SELECT RAISE(ABORT, "
+                f"'{SQLITE_RETENTION_ERROR_MESSAGE}'); END",
+            )
+            for name, table_name
+            in SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS.items()
+        },
+        **{
+            name: (
+                table_name,
+                f"CREATE TRIGGER {name} BEFORE UPDATE ON {table_name} "
+                f"BEGIN SELECT RAISE(ABORT, "
+                f"'{SQLITE_IMMUTABILITY_ERROR_MESSAGE}'); END",
+            )
+            for name, table_name
+            in SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS.items()
+        },
+        **{
+            name: (
+                table_name,
+                "CREATE TRIGGER validate_task_observation_ownership "
+                "BEFORE INSERT ON task_observations "
+                "WHEN NOT EXISTS ("
+                "SELECT 1 FROM tasks "
+                "JOIN observations ON observations.id = NEW.observation_id "
+                "JOIN assets ON assets.id = observations.asset_id "
+                "WHERE tasks.id = NEW.task_id "
+                "AND tasks.investigation_id = assets.investigation_id"
+                ") BEGIN SELECT RAISE(ABORT, "
+                "'task observation must belong to the same investigation'); END",
+            )
+            for name, table_name
+            in SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS.items()
+        },
+    }
+    if version >= 7:
+        expected_triggers.update(
+            {
+                name: (
+                    table_name,
+                    f"CREATE TRIGGER {name} BEFORE DELETE ON {table_name} "
+                    f"BEGIN SELECT RAISE(ABORT, "
+                    f"'{SQLITE_RETENTION_ERROR_MESSAGE}'); END",
+                )
+                for name, table_name
+                in SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS.items()
+            }
+        )
+        expected_triggers.update(
+            {
+                name: (
+                    table_name,
+                    f"CREATE TRIGGER {name} BEFORE UPDATE ON {table_name} "
+                    f"BEGIN SELECT RAISE(ABORT, "
+                    f"'{SQLITE_IMMUTABILITY_ERROR_MESSAGE}'); END",
+                )
+                for name, table_name
+                in SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS.items()
+            }
+        )
+    missing = []
+    invalid = []
+    for name, (expected_table, expected_sql) in expected_triggers.items():
+        actual = triggers.get(name)
+        if actual is None:
+            missing.append(name)
+            continue
+        actual_table, actual_sql = actual
+        if (
+            actual_table != expected_table
+            or _normalize_sql(actual_sql) != _normalize_sql(expected_sql)
+        ):
+            invalid.append(name)
+    if missing or invalid:
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(sorted(missing)))
+        if invalid:
+            details.append("invalid: " + ", ".join(sorted(invalid)))
+        raise MigrationError(
+            "SQLite task-observation protection triggers are invalid ("
+            + "; ".join(details)
+            + ")"
+        )
 
 
 def _validate_source_data_integrity(connection: Connection, version: int) -> None:
@@ -437,6 +651,68 @@ def _validate_source_data_integrity(connection: Connection, version: int) -> Non
                             f"PromotionAudit {audit_id} references missing "
                             f"{referenced_table} row {referenced_id}"
                         )
+
+    if version >= 7:
+        fingerprint_table = ObservationFingerprint.__table__
+        rows = connection.execute(
+            select(
+                Observation.id,
+                Observation.observation_type,
+                Observation.asset_id,
+                Observation.hypothesis_id,
+                Observation.data,
+                fingerprint_table.c.fingerprint,
+                fingerprint_table.c.duplicate_of_observation_id,
+            )
+            .select_from(
+                Observation.__table__.outerjoin(
+                    fingerprint_table,
+                    fingerprint_table.c.observation_id == Observation.id,
+                )
+            )
+            .order_by(Observation.id)
+        )
+        prior_identities: dict[str, list[tuple[int, bytes]]] = {}
+        for row in rows:
+            if row.fingerprint is None:
+                raise MigrationError(
+                    f"Observation {row.id} is missing its immutable fingerprint"
+                )
+            identity = canonical_observation_identity(
+                observation_type=row.observation_type,
+                asset_id=row.asset_id,
+                hypothesis_id=row.hypothesis_id,
+                data=row.data,
+            )
+            expected_fingerprint = observation_identity_fingerprint(
+                observation_type=row.observation_type,
+                asset_id=row.asset_id,
+                hypothesis_id=row.hypothesis_id,
+                data=row.data,
+            )
+            if row.fingerprint != expected_fingerprint:
+                raise MigrationError(
+                    f"Observation {row.id} has an incorrect evidence fingerprint"
+                )
+            expected_duplicate = next(
+                (
+                    prior_id
+                    for prior_id, prior_identity in prior_identities.get(
+                        expected_fingerprint, ()
+                    )
+                    if prior_identity == identity
+                ),
+                None,
+            )
+            if row.duplicate_of_observation_id != expected_duplicate:
+                raise MigrationError(
+                    f"Observation {row.id} has an incorrect duplicate-evidence link"
+                )
+            prior_identities.setdefault(expected_fingerprint, []).append(
+                (row.id, identity)
+            )
+
+
 def _add_investigation_budget_columns(connection: Connection) -> None:
     inspector = inspect(connection)
     if not inspector.has_table("investigations"):
@@ -484,10 +760,209 @@ def _install_sqlite_retention_triggers(connection: Connection) -> None:
         )
 
 
+def _add_task_deduplication_key(connection: Connection) -> None:
+    inspector = inspect(connection)
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    if "dedupe_key" not in task_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN dedupe_key VARCHAR(255)"
+        )
+    connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_dedupe_key "
+        "ON tasks (dedupe_key)"
+    )
+
+
+def _install_sqlite_immutability_triggers(connection: Connection) -> None:
+    if connection.dialect.name != "sqlite":
+        return
+
+    preparer = connection.dialect.identifier_preparer
+    for trigger_name, table_name in SQLITE_IMMUTABILITY_TRIGGERS.items():
+        connection.exec_driver_sql(
+            f"CREATE TRIGGER IF NOT EXISTS {preparer.quote(trigger_name)} "
+            f"BEFORE UPDATE ON {preparer.quote(table_name)} "
+            f"BEGIN SELECT RAISE(ABORT, "
+            f"'{SQLITE_IMMUTABILITY_ERROR_MESSAGE}'); END"
+        )
+
+
+def _create_v6_task_observation_links(connection: Connection) -> None:
+    for table_name in _TABLES_ADDED_IN_V6:
+        table = Base.metadata.tables.get(table_name)
+        if table is None:
+            raise MigrationError(f"Migration requires mapped table {table_name!r}")
+        table.create(connection, checkfirst=True)
+
+    if connection.dialect.name == "sqlite":
+        preparer = connection.dialect.identifier_preparer
+        for trigger_name, table_name in SQLITE_TASK_OBSERVATION_RETENTION_TRIGGERS.items():
+            connection.exec_driver_sql(
+                f"CREATE TRIGGER IF NOT EXISTS {preparer.quote(trigger_name)} "
+                f"BEFORE DELETE ON {preparer.quote(table_name)} "
+                f"BEGIN SELECT RAISE(ABORT, "
+                f"'{SQLITE_RETENTION_ERROR_MESSAGE}'); END"
+            )
+        for trigger_name, table_name in SQLITE_TASK_OBSERVATION_IMMUTABILITY_TRIGGERS.items():
+            connection.exec_driver_sql(
+                f"CREATE TRIGGER IF NOT EXISTS {preparer.quote(trigger_name)} "
+                f"BEFORE UPDATE ON {preparer.quote(table_name)} "
+                f"BEGIN SELECT RAISE(ABORT, "
+                f"'{SQLITE_IMMUTABILITY_ERROR_MESSAGE}'); END"
+            )
+        ownership_trigger = next(iter(SQLITE_TASK_OBSERVATION_OWNERSHIP_TRIGGERS))
+        connection.exec_driver_sql(
+            f"CREATE TRIGGER IF NOT EXISTS {preparer.quote(ownership_trigger)} "
+            f"BEFORE INSERT ON {preparer.quote('task_observations')} "
+            "WHEN NOT EXISTS ("
+            "SELECT 1 FROM tasks "
+            "JOIN observations ON observations.id = NEW.observation_id "
+            "JOIN assets ON assets.id = observations.asset_id "
+            "WHERE tasks.id = NEW.task_id "
+            "AND tasks.investigation_id = assets.investigation_id"
+            ") BEGIN SELECT RAISE(ABORT, "
+            "'task observation must belong to the same investigation'); END"
+        )
+
+
+def _create_v7_observation_fingerprints(connection: Connection) -> None:
+    for table_name in _TABLES_ADDED_IN_V7:
+        table = Base.metadata.tables.get(table_name)
+        if table is None:
+            raise MigrationError(f"Migration requires mapped table {table_name!r}")
+        table.create(connection, checkfirst=True)
+
+    observation_rows = connection.execute(
+        select(
+            Observation.id,
+            Observation.observation_type,
+            Observation.asset_id,
+            Observation.hypothesis_id,
+            Observation.data,
+        )
+        .select_from(
+            Observation.__table__.outerjoin(
+                ObservationFingerprint.__table__,
+                ObservationFingerprint.observation_id == Observation.id,
+            )
+        )
+        .where(ObservationFingerprint.observation_id.is_(None))
+        .order_by(Observation.id)
+    ).all()
+    prior_identities: dict[str, list[tuple[int, bytes]]] = {}
+    existing_rows = connection.execute(
+        select(
+            Observation.id,
+            Observation.observation_type,
+            Observation.asset_id,
+            Observation.hypothesis_id,
+            Observation.data,
+        )
+        .select_from(
+            Observation.__table__.join(
+                ObservationFingerprint.__table__,
+                ObservationFingerprint.observation_id == Observation.id,
+            )
+        )
+        .order_by(Observation.id)
+    )
+    for row in existing_rows:
+        identity = canonical_observation_identity(
+            observation_type=row.observation_type,
+            asset_id=row.asset_id,
+            hypothesis_id=row.hypothesis_id,
+            data=row.data,
+        )
+        fingerprint = observation_identity_fingerprint(
+            observation_type=row.observation_type,
+            asset_id=row.asset_id,
+            hypothesis_id=row.hypothesis_id,
+            data=row.data,
+        )
+        prior_identities.setdefault(fingerprint, []).append((row.id, identity))
+
+    for row in observation_rows:
+        identity = canonical_observation_identity(
+            observation_type=row.observation_type,
+            asset_id=row.asset_id,
+            hypothesis_id=row.hypothesis_id,
+            data=row.data,
+        )
+        fingerprint = observation_identity_fingerprint(
+            observation_type=row.observation_type,
+            asset_id=row.asset_id,
+            hypothesis_id=row.hypothesis_id,
+            data=row.data,
+        )
+        duplicate_of_id = next(
+            (
+                prior_id
+                for prior_id, prior_identity in prior_identities.get(fingerprint, ())
+                if prior_identity == identity
+            ),
+            None,
+        )
+        connection.execute(
+            ObservationFingerprint.__table__.insert().values(
+                observation_id=row.id,
+                fingerprint=fingerprint,
+                duplicate_of_observation_id=duplicate_of_id,
+                created_at=datetime.now(UTC),
+            )
+        )
+        prior_identities.setdefault(fingerprint, []).append((row.id, identity))
+
+    if connection.dialect.name == "sqlite":
+        preparer = connection.dialect.identifier_preparer
+        for trigger_name, table_name in (
+            *SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS.items(),
+            *SQLITE_OBSERVATION_FINGERPRINT_IMMUTABILITY_TRIGGERS.items(),
+        ):
+            operation = (
+                "DELETE"
+                if trigger_name in SQLITE_OBSERVATION_FINGERPRINT_RETENTION_TRIGGERS
+                else "UPDATE"
+            )
+            message = (
+                SQLITE_RETENTION_ERROR_MESSAGE
+                if operation == "DELETE"
+                else SQLITE_IMMUTABILITY_ERROR_MESSAGE
+            )
+            connection.exec_driver_sql(
+                f"CREATE TRIGGER IF NOT EXISTS {preparer.quote(trigger_name)} "
+                f"BEFORE {operation} ON {preparer.quote(table_name)} "
+                f"BEGIN SELECT RAISE(ABORT, '{message}'); END"
+            )
+
+
+
+def _add_program_required_request_headers(connection: Connection) -> None:
+    """Add required request headers to legacy program records."""
+    existing_columns = {
+        column["name"] for column in inspect(connection).get_columns("programs")
+    }
+    if "required_request_headers" in existing_columns:
+        return
+
+    connection.exec_driver_sql(
+        """ALTER TABLE "programs"
+        ADD COLUMN "required_request_headers" JSON NOT NULL DEFAULT '{}'"""
+    )
+
+
 _MIGRATIONS = (
     Migration(1, "investigation_budgets", _add_investigation_budget_columns),
     Migration(2, "task_verification_and_v81_tables", _create_v2_tables),
     Migration(3, "sqlite_historical_record_retention", _install_sqlite_retention_triggers),
+    Migration(4, "concurrent_task_deduplication", _add_task_deduplication_key),
+    Migration(5, "sqlite_historical_record_immutability", _install_sqlite_immutability_triggers),
+    Migration(6, "task_observation_links", _create_v6_task_observation_links),
+    Migration(7, "observation_fingerprints", _create_v7_observation_fingerprints),
+    Migration(
+        8,
+        "program_required_request_headers",
+        _add_program_required_request_headers,
+    ),
 )
 LATEST_SCHEMA_VERSION = len(_MIGRATIONS)
 

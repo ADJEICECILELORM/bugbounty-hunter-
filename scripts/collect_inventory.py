@@ -28,20 +28,26 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.db import open_ready_database  # noqa: E402
+from scripts.database_options import (  # noqa: E402
+    OperatorDatabaseError,
+    add_database_option,
+    open_operator_database,
+)
 from data.models import Asset, Investigation, Task  # noqa: E402
 from gateway.scope_policy import ScopePolicy  # noqa: E402
 from orchestration.session_helpers import (  # noqa: E402
     ensure_running_investigation,
     run_under_investigation,
 )
+from orchestration.task_runner import run_task  # noqa: E402
+from verification.investigation_tasks import create_task  # noqa: E402
 
 DB_NAME = "lab_evidence_v3.db"
 _HTTP_SCHEMES = frozenset({"http", "https"})
@@ -60,12 +66,19 @@ def _build_authorize(investigation: Investigation) -> Callable[[str], bool]:
 
 
 def _base_hostname(base_url: str) -> str:
-    parsed = urlsplit(base_url)
-    if parsed.scheme not in _HTTP_SCHEMES or not parsed.hostname:
-        raise ValueError(
-            f"base_url must be an absolute http(s) URL with a host, got {base_url!r}"
-        )
-    return parsed.hostname.lower()
+    try:
+        parsed = urlsplit(base_url)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("base_url must be a valid absolute http(s) URL") from None
+    if parsed.scheme not in _HTTP_SCHEMES or not parsed.netloc or not hostname:
+        raise ValueError("base_url must be a valid absolute http(s) URL with a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("base_url must not include URL credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base_url must not include a query or fragment")
+    return hostname.lower()
 
 
 def _ensure_asset(
@@ -93,26 +106,79 @@ def run_collect_inventory(
     base_url: str,
     authorize: Callable[[str], bool],
     allow_private_network: bool = False,
+    commit_before_dispatch: bool = False,
 ) -> tuple[Investigation, Asset, Task]:
     """Own an inventory task under ``investigation`` and run the collector.
 
     Ensures an ``Asset`` for ``base_url``'s host, creates an ``inventory`` task,
     and dispatches
     :func:`verification.endpoint_inventory_collector.collect_seed_inventory`
-    through the task runner. Flush only: the caller owns the transaction. A
-    failed collection marks the task ``failed`` and re-raises; nothing is
+    through the task runner. The caller owns the transaction unless
+    ``commit_before_dispatch`` explicitly checkpoints the running task and its
+    start event before collection so an interrupted CLI invocation can recover
+    it. A failed collection marks the task ``failed`` and re-raises; nothing is
     promoted.
     """
-    asset = _ensure_asset(session, investigation, base_url)
-    task = run_under_investigation(
-        session,
-        investigation_id=investigation.id,
-        kind="inventory",
-        title=f"Collect endpoint inventory for {base_url}",
-        params={"asset_id": asset.id, "base_url": base_url},
-        authorize=authorize,
-        allow_private_network=allow_private_network,
-    )
+    _base_hostname(base_url)
+    if not authorize(base_url):
+        raise ValueError("base_url is outside the investigation's authorized scope")
+    task_error: Exception | None = None
+    asset: Asset
+    task: Task | None = None
+    with session.begin_nested():
+        prior_task_id = session.scalar(
+            select(func.max(Task.id)).where(
+                Task.investigation_id == investigation.id
+            )
+        ) or 0
+        asset = _ensure_asset(session, investigation, base_url)
+        if commit_before_dispatch:
+            task = create_task(
+                investigation.id,
+                session,
+                kind="inventory",
+                title=f"Collect endpoint inventory for {base_url}",
+                params={"asset_id": asset.id, "base_url": base_url},
+            )
+        else:
+            try:
+                task = run_under_investigation(
+                    session,
+                    investigation_id=investigation.id,
+                    kind="inventory",
+                    title=f"Collect endpoint inventory for {base_url}",
+                    params={"asset_id": asset.id, "base_url": base_url},
+                    authorize=authorize,
+                    allow_private_network=allow_private_network,
+                )
+            except Exception as error:
+                # Preserve a dispatched failure and its audit event; failures
+                # before task creation roll back the speculative asset.
+                failed_task = session.scalar(
+                    select(Task.id).where(
+                        Task.investigation_id == investigation.id,
+                        Task.id > prior_task_id,
+                        Task.kind == "inventory",
+                        Task.status == "failed",
+                    )
+                )
+                if failed_task is None:
+                    raise
+                task_error = error
+    if commit_before_dispatch and task is not None:
+        try:
+            run_task(
+                task.id,
+                session,
+                authorize=authorize,
+                allow_private_network=allow_private_network,
+                commit_before_dispatch=True,
+            )
+        except Exception as error:
+            task_error = error
+    if task_error is not None:
+        raise task_error
+    assert task is not None
     return investigation, asset, task
 
 
@@ -144,6 +210,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow private-network (lab) targets for this run only",
     )
+    add_database_option(parser)
     return parser
 
 
@@ -155,8 +222,12 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
-    db_path = (REPO_ROOT / DB_NAME).resolve()
-    engine = open_ready_database(f"sqlite+pysqlite:///{db_path.as_posix()}")
+    try:
+        engine, _db_path = open_operator_database(
+            args.database, default_path=REPO_ROOT / DB_NAME
+        )
+    except OperatorDatabaseError as error:
+        raise SystemExit(str(error)) from error
 
     with Session(engine) as session:
         try:
@@ -169,6 +240,18 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(str(error)) from error
 
         authorize = _build_authorize(investigation)
+        if not authorize(args.base_url):
+            raise SystemExit(
+                f"base_url host {_base_hostname(args.base_url)!r} is outside the "
+                f"authorized scope for investigation #{investigation.id} "
+                f"(authorized={investigation.program.authorized_scope!r}, "
+                f"excluded={investigation.program.excluded_scope!r})."
+            )
+        prior_task_id = session.scalar(
+            select(func.max(Task.id)).where(
+                Task.investigation_id == investigation.id
+            )
+        ) or 0
         try:
             investigation, asset, task = run_collect_inventory(
                 session,
@@ -176,9 +259,21 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 authorize=authorize,
                 allow_private_network=args.lab,
+                commit_before_dispatch=True,
             )
         except Exception as error:  # noqa: BLE001 - persist the failed task, then stop
-            session.commit()
+            failed_task = session.scalar(
+                select(Task.id).where(
+                    Task.investigation_id == investigation.id,
+                    Task.id > prior_task_id,
+                    Task.kind == "inventory",
+                    Task.status == "failed",
+                )
+            )
+            if failed_task is not None:
+                session.commit()
+            else:
+                session.rollback()
             print(
                 f"Investigation #{investigation.id}: inventory task failed: "
                 f"{type(error).__name__}: {error}"

@@ -199,6 +199,54 @@ def test_adapter_connects_to_pinned_ip_but_keeps_hostname_for_tls(
     assert pool.ConnectionCls is http_probe._PinnedHTTPSConnection
     deadline.cancel()
     adapter.close()
+def test_configured_proxy_is_rejected_before_any_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = PinnedTarget(
+        "https://example.test/",
+        "example.test",
+        443,
+        (ipaddress.ip_address("93.184.216.34"),),
+    )
+    deadline = http_probe._RequestDeadline(1.0)
+    adapter = http_probe._PinnedHTTPAdapter(target, target.addresses[0], deadline)
+    prepared_request = requests.Request("GET", target.url).prepare()
+
+    with pytest.raises(requests.exceptions.ProxyError, match="Proxies are disabled"):
+        adapter.get_connection_with_tls_context(
+            prepared_request,
+            verify=True,
+            proxies={"https": "http://proxy.example.test:8080"},
+        )
+
+    deadline.cancel()
+    adapter.close()
+
+
+def test_proxy_settings_cannot_bypass_pinned_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = PinnedTarget(
+        "https://example.test/",
+        "example.test",
+        443,
+        (ipaddress.ip_address("93.184.216.34"),),
+    )
+    response = FakeResponse()
+    session = FakeSession(response=response)
+    monkeypatch.setattr(dns_pin, "pin_url", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(http_probe.requests, "Session", lambda: session)
+    # Simulate a hostile environment proxy; the probe must ignore it entirely.
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
+
+    result = http_probe.probe_endpoint(target.url, authorize=lambda _: True)
+
+    assert isinstance(result, ProbeResult)
+    assert session.trust_env is False  # environment proxies are never consulted
+    assert session.closed
+
+
+
 
 
 def test_out_of_scope_url_is_rejected_before_any_request(

@@ -106,6 +106,29 @@ def test_start_task_moves_pending_to_running_and_sets_started_at(
     assert task.ended_at is None
 
 
+def test_started_transition_rolls_back_when_audit_event_cannot_be_written(
+    session: Session,
+    investigation: Investigation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import verification.investigation_tasks as task_api
+
+    task = create_task(investigation.id, session, kind="report", title="atomic start")
+    original_append = task_api._append
+
+    def fail_started_event(task, event_type, detail, active_session):
+        if event_type == "started":
+            raise RuntimeError("audit insert failed")
+        return original_append(task, event_type, detail, active_session)
+
+    monkeypatch.setattr(task_api, "_append", fail_started_event)
+    with pytest.raises(RuntimeError, match="audit insert failed"):
+        start_task(task.id, session)
+
+    assert task.status == PENDING
+    assert [event.event_type for event in task.events] == ["created"]
+
+
 @pytest.mark.parametrize("final_status", sorted(FINAL_STATUSES))
 def test_complete_task_ends_a_running_task(
     session: Session, investigation: Investigation, final_status: str
@@ -161,6 +184,7 @@ def test_every_allowlisted_kind_is_accepted(
 
     params_by_kind = {
         "inventory": {"asset_id": asset.id, "base_url": "https://example.test/"},
+        "research_brief": {"asset_id": asset.id},
         "hypothesis_generation": {"asset_id": asset.id},
         "verification": {"hypothesis_id": hypothesis.id},
     }
@@ -624,7 +648,13 @@ def test_only_the_task_module_writes_a_task_status_or_timestamp() -> None:
         {path.name for path in sources if pattern.search(path.read_text(encoding="utf-8"))}
     )
 
-    assert writers == ["investigation_tasks.py"]
+    assert writers == []
+    atomic_writers = sorted(
+        path.name
+        for path in sources
+        if re.search(r"update\s*\(\s*Task\s*\)", path.read_text(encoding="utf-8"))
+    )
+    assert atomic_writers == ["investigation_tasks.py"]
 
 
 def test_only_the_lifecycle_modules_write_investigation_or_task_status() -> None:
@@ -643,4 +673,10 @@ def test_only_the_lifecycle_modules_write_investigation_or_task_status() -> None
     }
 
     assert investigation_writers == ["investigation_lifecycle.py"]
-    assert any_status_writers == {"investigation_lifecycle.py", "investigation_tasks.py"}
+    assert any_status_writers == {"investigation_lifecycle.py"}
+    task_status_updates = sorted(
+        path.name
+        for path in sources
+        if re.search(r"update\s*\(\s*Task\s*\)", path.read_text(encoding="utf-8"))
+    )
+    assert task_status_updates == ["investigation_tasks.py"]

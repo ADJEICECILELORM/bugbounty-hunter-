@@ -18,8 +18,11 @@ from sqlalchemy import (
 from data.migrations import (
     LATEST_SCHEMA_VERSION,
     MigrationError,
+    SQLITE_IMMUTABILITY_ERROR_MESSAGE,
+    SQLITE_IMMUTABILITY_TRIGGERS,
     SQLITE_RETENTION_ERROR_MESSAGE,
     SQLITE_RETENTION_TRIGGERS,
+    _validate_sqlite_task_observation_triggers,
     initialize_fresh_schema,
     preflight_migration,
 )
@@ -133,6 +136,49 @@ def check_database_integrity(engine: Engine) -> None:
                     + "; ".join(details)
                     + ")"
                 )
+
+            missing_immutability_triggers = []
+            invalid_immutability_triggers = []
+            for name, expected_table in SQLITE_IMMUTABILITY_TRIGGERS.items():
+                actual = installed_triggers.get(name)
+                if actual is None:
+                    missing_immutability_triggers.append(name)
+                    continue
+                table_name, sql = actual
+                expected_sql = (
+                    f"CREATE TRIGGER {preparer.quote(name)} "
+                    f"BEFORE UPDATE ON {preparer.quote(expected_table)} "
+                    f"BEGIN SELECT RAISE(ABORT, "
+                    f"'{SQLITE_IMMUTABILITY_ERROR_MESSAGE}'); END"
+                )
+                normalized_sql = " ".join(sql.upper().split())
+                if (
+                    table_name != expected_table
+                    or normalized_sql != " ".join(expected_sql.upper().split())
+                ):
+                    invalid_immutability_triggers.append(name)
+
+            if missing_immutability_triggers or invalid_immutability_triggers:
+                details = []
+                if missing_immutability_triggers:
+                    details.append(
+                        "missing: "
+                        + ", ".join(sorted(missing_immutability_triggers))
+                    )
+                if invalid_immutability_triggers:
+                    details.append(
+                        "invalid: "
+                        + ", ".join(sorted(invalid_immutability_triggers))
+                    )
+                raise DatabaseIntegrityError(
+                    "SQLite historical-immutability triggers are not valid ("
+                    + "; ".join(details)
+                    + ")"
+                )
+            try:
+                _validate_sqlite_task_observation_triggers(connection)
+            except MigrationError as error:
+                raise DatabaseIntegrityError(str(error)) from error
             return
 
         metadata = MetaData()

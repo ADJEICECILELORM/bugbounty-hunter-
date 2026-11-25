@@ -75,7 +75,9 @@ def _normalized_base(base_url: str) -> str:
     return urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
-def seed_paths(base_url: str) -> list[str]:
+def seed_paths(
+    base_url: str, *, expected_hostname: str | None = None
+) -> list[str]:
     """Join the fixed seed list onto ``base_url`` and return absolute URLs.
 
     The join is deliberate concatenation of the normalized base and a path that
@@ -84,12 +86,18 @@ def seed_paths(base_url: str) -> list[str]:
     :data:`SEED_PATHS`, and a fresh list is returned on every call.
     """
     base = _normalized_base(base_url)
+    if expected_hostname is not None:
+        actual_hostname = urlsplit(base).hostname or ""
+        if actual_hostname.rstrip(".").lower() != expected_hostname.rstrip(".").lower():
+            raise ValueError("inventory base URL does not match the asset host")
     return [f"{base}{path}" for path in SEED_PATHS]
 
 
 def inventory_from_seeds(
     base_url: str,
     authorize: Callable[[str], bool],
+    *,
+    expected_hostname: str | None = None,
 ) -> list[str]:
     """Seed candidates filtered by ``authorize``, in seed order.
 
@@ -98,4 +106,8 @@ def inventory_from_seeds(
     returned that the callback did not see. An authorizer that rejects
     everything yields an empty inventory, not a default.
     """
-    return [url for url in seed_paths(base_url) if authorize(url)]
+    return [
+        url
+        for url in seed_paths(base_url, expected_hostname=expected_hostname)
+        if authorize(url)
+    ]

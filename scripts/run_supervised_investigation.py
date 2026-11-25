@@ -41,7 +41,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.db import open_ready_database  # noqa: E402
+from scripts.database_options import (  # noqa: E402
+    OperatorDatabaseError,
+    add_database_option,
+    open_operator_database,
+)
 from data.models import Investigation  # noqa: E402
 from gateway.scope_policy import ScopePolicy  # noqa: E402
 from orchestration.supervised_cycle import (  # noqa: E402
@@ -49,6 +53,7 @@ from orchestration.supervised_cycle import (  # noqa: E402
     DEFAULT_STUCK_THRESHOLD_SECONDS,
     run_supervised_cycle,
 )
+from verification.plan_input import VerificationPlanInputError, read_verification_plan  # noqa: E402
 
 DB_NAME = "lab_evidence_v3.db"
 MAX_CYCLES = 5
@@ -101,13 +106,41 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow private-network (lab) targets for this run only",
     )
+    parser.add_argument(
+        "--approve-verification",
+        action="store_true",
+        help="explicitly approve network verification tasks in this invocation",
+    )
+    parser.add_argument(
+        "--verification-plan-stdin",
+        action="store_true",
+        help="read the transient JSON verification plan from stdin (never persisted)",
+    )
+    add_database_option(parser)
     return parser
 
 
 def _print_report(report: CycleReport) -> None:
-    print(f"Investigation {report.investigation_id}: {len(report.proposed)} task(s) proposed:")
+    print(
+        f"Investigation {report.investigation_id}: "
+        f"{len(report.proposed)} ready task(s) proposed:"
+    )
     for task in report.proposed:
         print(f"  #{task.task_id} {task.kind}: {task.title}")
+    for task in report.planned_inventory_tasks:
+        dependency_text = (
+            f"; depends on {', '.join(map(str, task.depends_on))}"
+            if task.depends_on
+            else ""
+        )
+        print(
+            f"  [planned] {task.kind} for asset #{task.asset_id}: {task.title}"
+            f"{dependency_text}"
+        )
+        if task.kind == "hypothesis_review" and task.priority_reason:
+            print(
+                f"    review order {task.priority_rank}; {task.priority_reason}"
+            )
     for skip in report.skipped:
         print(f"  [skipped: {skip.reason}] {skip.detail}")
     for result in report.executed:
@@ -118,21 +151,40 @@ def _print_report(report: CycleReport) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     if not 1 <= args.max_cycles <= MAX_CYCLES:
         raise SystemExit(f"--max-cycles must be between 1 and {MAX_CYCLES}")
     if args.threshold_seconds < 0:
         raise SystemExit("--threshold-seconds must be >= 0")
+    if args.approve_verification != args.verification_plan_stdin:
+        parser.error(
+            "--approve-verification and --verification-plan-stdin must be supplied together"
+        )
+    if args.approve_verification and not args.yes:
+        parser.error("verification approval requires --yes to execute")
+    if args.approve_verification and not args.lab:
+        parser.error("verification approval requires --lab for the lab-only verifier")
+    verification_plan = None
+    if args.verification_plan_stdin:
+        try:
+            verification_plan = read_verification_plan(sys.stdin)
+        except VerificationPlanInputError as error:
+            parser.error(str(error))
 
-    db_path = (REPO_ROOT / DB_NAME).resolve()
-    engine = open_ready_database(f"sqlite+pysqlite:///{db_path.as_posix()}")
+    try:
+        engine, db_path = open_operator_database(
+            args.database, default_path=REPO_ROOT / DB_NAME
+        )
+    except OperatorDatabaseError as error:
+        raise SystemExit(str(error)) from error
 
     with Session(engine) as session:
         investigation = session.get(Investigation, args.investigation_id)
         if investigation is None:
             raise SystemExit(
-                f"No Investigation #{args.investigation_id} exists in {DB_NAME}."
+                f"No Investigation #{args.investigation_id} exists in {db_path}."
             )
 
         authorize = _build_authorize(investigation)
@@ -159,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
                     threshold_seconds=args.threshold_seconds,
                     authorize=authorize,
                     allow_private_network=args.lab,
+                    verification_plan=verification_plan,
+                    approve_verification=args.approve_verification,
+                    commit_task_start=True,
                 )
             except (LookupError, ValueError) as error:
                 print(f"Refused: {error}")
@@ -171,12 +226,33 @@ def main(argv: list[str] | None = None) -> int:
                 print("Blocked: run scripts/recover_investigation.py first.")
                 final_status = 1
                 break
+            if any(
+                skip.reason
+                in {
+                    "verification_plan_required",
+                    "verification_plan_mismatch",
+                    "verification_approval_required",
+                }
+                for skip in report.skipped
+            ):
+                print("Blocked: verification requires a plan and explicit approval.")
+                final_status = 1
+                break
             if not report.proposed:
                 print("Nothing proposed; no further cycles.")
                 break
             if report.executed and not report.executed[-1].ok:
+                failed = report.executed[-1]
                 print("Stopped: a task failed (stop-on-first-failure policy).")
+                print(
+                    f"Review task #{failed.task_id} ({failed.kind}); once the cause "
+                    f"is fixed, run `scripts/recover_investigation.py "
+                    f"{args.investigation_id} --retry {failed.task_id}` to retry it."
+                )
                 final_status = 1
+                break
+            if any(result.kind == "verification" for result in report.executed):
+                print("Stopped after one explicitly approved verification task.")
                 break
 
         session.commit()
@@ -190,4 +266,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

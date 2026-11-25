@@ -206,6 +206,12 @@ def test_part_one_scenario_stores_evidence_and_verdicts(
         assert outcome.observation.observation_type == "diff_check"
         assert outcome.observation.hypothesis_id == hypothesis.id
         assert outcome.verdict.observation_id == outcome.observation.id
+        provenance = outcome.observation.provenance
+        assert provenance is not None
+        assert provenance.collector == "lab-verifier"
+        assert provenance.authorization_program_id == hypothesis.asset.investigation.program_id
+        assert provenance.authorization_snapshot["caller_authorizer_approved"] is True
+        assert provenance.authorization_snapshot["lab_mode"] is True
 
 
 def test_controls_are_probed_before_any_claim_pair(
@@ -439,6 +445,44 @@ def test_a_target_outside_scope_aborts_before_any_request(
     assert session.scalars(select(Verdict)).all() == []
 
 
+def test_plan_cannot_use_another_in_scope_host_for_hypothesis_evidence(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hypothesis = seed_hypothesis(session)
+    transport = FakeTransport({})
+    monkeypatch.setattr(runner, "pin_lab_url", transport.pin)
+    plan = VerificationTestPlan(
+        pairs=(
+            control_pair(
+                url_a="http://other.example.test/control-a",
+                url_b="http://other.example.test/control-b",
+            ),
+            RequestPair(
+                name="claim-other-host",
+                url_a="http://other.example.test/account",
+                url_b="http://other.example.test/account",
+                claim=CLAIM,
+                extra_headers_a={"Authorization": "account-a"},
+                extra_headers_b={"Authorization": "account-b"},
+            ),
+        ),
+        hypothesis_id=hypothesis.id,
+    )
+
+    with pytest.raises(TargetRejected, match="hypothesis asset host"):
+        runner.run_hypothesis_verification(
+            hypothesis.id,
+            plan,
+            allow_private_network=True,
+            authorize=lambda _url: True,
+            session=session,
+        )
+
+    assert transport.calls == []
+    assert session.scalars(select(Observation)).all() == []
+    assert session.scalars(select(Verdict)).all() == []
+
+
 # --- plan validation happens before any request ----------------------------
 
 
@@ -536,6 +580,24 @@ def test_missing_lab_opt_in_is_refused_before_any_request(
         run_plan(session, hypothesis.id, part_one_plan(), allow_private_network=False)
 
     assert transport.calls == []
+
+
+def test_bound_plan_cannot_be_used_for_another_hypothesis(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hypothesis = seed_hypothesis(session)
+    transport = install_transport(monkeypatch, part_one_responses())
+    plan = VerificationTestPlan(
+        pairs=part_one_plan().pairs,
+        hypothesis_id=hypothesis.id + 100,
+    )
+
+    with pytest.raises(InvalidTestPlan, match="bound to a different hypothesis"):
+        run_plan(session, hypothesis.id, plan)
+
+    assert transport.calls == []
+    assert session.scalars(select(Observation)).all() == []
+    assert session.scalars(select(Verdict)).all() == []
 
 
 def test_plan_shape_is_validated_before_the_hypothesis_is_looked_up(

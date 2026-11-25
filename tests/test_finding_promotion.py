@@ -382,11 +382,11 @@ def test_promotion_is_refused_when_a_supporting_verdict_was_edited(
 
     supported_verdict.rationale = "edited after the review"
 
-    with pytest.raises(PromotionRefused) as error:
+    with pytest.raises(HistoricalRecordIsImmutable, match="cannot be updated"):
         promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
 
-    assert "integrity" in str(error.value)
-    assert session.scalars(select(Finding)).all() == []
+    with session.no_autoflush:
+        assert session.scalars(select(Finding)).all() == []
     assert session.get(Hypothesis, hypothesis.id).status == "unverified"
 
 
@@ -404,7 +404,8 @@ def test_promotion_is_refused_when_the_bound_evidence_was_edited(
         promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
 
     assert "integrity" in str(error.value)
-    assert session.scalars(select(Finding)).all() == []
+    with session.no_autoflush:
+        assert session.scalars(select(Finding)).all() == []
 
 
 def test_promotion_is_refused_when_a_control_verdict_was_edited(
@@ -417,10 +418,9 @@ def test_promotion_is_refused_when_a_control_verdict_was_edited(
 
     control_verdict.verdict = "supported"
 
-    with pytest.raises(PromotionRefused) as error:
+    with pytest.raises(HistoricalRecordIsImmutable, match="cannot be updated"):
         promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
 
-    assert "integrity" in str(error.value)
 
 
 def test_a_supported_row_that_no_digest_binds_is_refused(session: Session) -> None:
@@ -452,7 +452,8 @@ def test_a_supported_row_that_no_digest_binds_is_refused(session: Session) -> No
         promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
 
     assert "integrity" in str(error.value)
-    assert session.scalars(select(Finding)).all() == []
+    with session.no_autoflush:
+        assert session.scalars(select(Finding)).all() == []
 
 
 def test_promotion_is_refused_when_a_verdict_is_rebound_to_other_evidence(
@@ -474,11 +475,11 @@ def test_promotion_is_refused_when_a_verdict_is_rebound_to_other_evidence(
 
     original_verdict.observation_id = other_observation.id
 
-    with pytest.raises(PromotionRefused) as error:
+    with pytest.raises(HistoricalRecordIsImmutable, match="cannot be updated"):
         promote_to_finding(hypothesis.id, session, approved_by="Ada Reviewer")
 
-    assert "integrity" in str(error.value)
-    assert session.scalars(select(Finding)).all() == []
+    with session.no_autoflush:
+        assert session.scalars(select(Finding)).all() == []
     assert session.get(Hypothesis, hypothesis.id).status == "unverified"
 
 

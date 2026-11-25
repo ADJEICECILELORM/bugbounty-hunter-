@@ -1,5 +1,15 @@
 # V1 Build Plan — Agentic Bug Bounty Hunter
 
+## Project 001 checkpoint — 2026-11-10
+
+- Verified repository checkpoint: `HEAD` and `origin/main` both point to `9156c754` (`fix: enforce database migration and evidence integrity`). The local branch is `project-001-approved-work`.
+- Missions 004–009 are implemented in the current worktree; status and freshly run test results are tracked in `MISSION_PROGRESS.md`.
+- Mission 004 plans duplicate-safe, scope-checked research task chains from stored endpoint inventory. The supervised cycle previews proposals read-only and invokes the planner before execution.
+- Missions 005–006 add passive DNS/research-brief dispatch and bounded transient verification-plan input with explicit approval gates. Hypothesis generation remains the existing external LLM caller and runs only when an operator executes that task. The verifier remains lab-only.
+- Missions 007–008 integrate the stages in the human-triggered supervisor and exercise success, failure, duplicate planning, budgets, recovery, and verification approval on temporary databases with network/model/verifier boundaries mocked.
+- Mission 009 documents actual behavior, binds verification plans to one hypothesis, limits each approval to one verification task, and redacts query strings/fragments from persisted verification evidence. Safe regression: 621 passed; 12 cases that copy checked-in evidence databases were deselected. `git diff --check` passed.
+- **Separate operator task:** the Juice Shop basket comparison remains a deliberate user-run local lab exercise. It is outside Missions 004–009 and must not run as part of tests or supervised automation.
+
 ## Project 001 — Milestone A migration safety remediation
 
 - ✅ Explicit migration preflight now validates versioned schema constraints and source foreign-key integrity before backup or migration; each migration's resulting schema is validated before its history row is recorded.
@@ -176,4 +186,10 @@ Per your roadmap, V2 is investigation intelligence. Hypothesis generation, untru
 - ✅ `intelligence.hypothesis_generation.generate_hypotheses` now enforces the investigation's LLM-call budget before spending a token, closing the direct-call gap left by `create_task` alone. It counts `hypothesis_generation` tasks with the same NULL-fallback defaults but excludes the in-flight task `run_task` just marked `running`, so a dispatched task is not double-counted and a direct call raises `BudgetExhausted` once the budget is full. Tests: `tests/test_hypothesis_generation.py` (2 new cases: the direct-call refusal and the dispatched non-double-count).
 - Full suite at this slice: `509 passed`.
 
+## Project 001 — Missions 017–020 evidence integrity, operator experience, resilience, and release readiness (complete)
 
+- Mission 017 (evidence integrity) completed: structured v6 task-to-observation input/output links, SQLite ownership and append-only triggers, schema-readiness validation, canonical evidence fingerprints with duplicate rows retained, and the v6/v7 migration split with synthetic v0/v4/v5/v6 upgrade coverage. Full suite at that checkpoint: `707 passed`.
+- Mission 018 (operator experience) completed: scope refusals explain the offending host and stored scope, task failures print `recover_investigation.py --retry` guidance, and the status board flags budget exhaustion.
+- Mission 019 (resilience and end-to-end testing) completed: the supervised workflow is exercised end to end on temporary databases with network/LLM/verifier boundaries mocked, plus a new tampered-database readiness-refusal case.
+- Mission 020 (release readiness) completed: schema documentation updated to version 7, and the release verdict is recorded in `MISSION_PROGRESS.md`.
+- Body hashes cannot be independently recomputed because response bodies are not retained; PostgreSQL immutability is out of scope.

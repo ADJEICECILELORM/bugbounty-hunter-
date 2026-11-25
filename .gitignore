@@ -5,3 +5,12 @@ venv/
 /lab_evidence.db*
 /lab_evidence_v3.db*
 /finding-*.md
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx

@@ -23,6 +23,7 @@ import orchestration.supervised_cycle as cycle
 import orchestration.task_runner as runner
 from data.db import init_db
 from data.models import Asset, Program
+from data.models import Observation, Task
 from verification.investigation_lifecycle import start_investigation
 from verification.investigation_tasks import (
     complete_task,
@@ -60,8 +61,10 @@ def make_task(session, investigation, *, title, depends_on=None):
     )
 
 
-def seed_asset(session: Session, investigation) -> Asset:
-    asset = Asset(investigation_id=investigation.id, hostname="example.test")
+def seed_asset(
+    session: Session, investigation, hostname: str = "example.test"
+) -> Asset:
+    asset = Asset(investigation_id=investigation.id, hostname=hostname)
     session.add(asset)
     session.flush()
     return asset
@@ -146,6 +149,162 @@ def test_empty_plan_is_ok(session: Session, investigation) -> None:
     assert report.proposed == []
     assert report.executed == []
     assert [skip.reason for skip in report.skipped] == ["empty"]
+
+
+def test_dry_run_previews_inventory_chain_without_creating_tasks(
+    session: Session, investigation
+) -> None:
+    asset = seed_asset(session, investigation, hostname="api.example.test")
+    session.add(
+        Observation(
+            asset_id=asset.id,
+            observation_type="endpoint_inventory",
+            data={"url": "https://api.example.test/account", "status_code": 200},
+        )
+    )
+    session.flush()
+    session_state = (
+        set(session.new),
+        set(session.dirty),
+        set(session.deleted),
+    )
+
+    report = cycle.run_supervised_cycle(investigation.id, session, execute=False)
+
+    assert report.proposed == []
+    assert [item.kind for item in report.planned_inventory_tasks] == [
+        "research_brief",
+        "hypothesis_generation",
+        "hypothesis_review",
+    ]
+    assert session.query(Task).count() == 0
+    assert (set(session.new), set(session.dirty), set(session.deleted)) == session_state
+
+
+def test_execute_plans_inventory_then_runs_only_ready_research_task(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset = seed_asset(session, investigation, hostname="api.example.test")
+    session.add(
+        Observation(
+            asset_id=asset.id,
+            observation_type="endpoint_inventory",
+            data={"url": "https://api.example.test/account", "status_code": 200},
+        )
+    )
+    session.flush()
+    called: list[int] = []
+
+    def fake_run(task_id, active_session, **kwargs):
+        called.append(task_id)
+        start_task(task_id, active_session)
+        complete_task(task_id, active_session, final_status="completed")
+
+    monkeypatch.setattr(cycle, "run_task", fake_run)
+    report = cycle.run_supervised_cycle(investigation.id, session, execute=True)
+
+    assert [item.kind for item in report.proposed] == ["research_brief"]
+    assert [item.task_id for item in report.executed] == called
+    assert report.executed[0].ok is True
+    tasks = session.query(Task).order_by(Task.id).all()
+    assert [task.kind for task in tasks] == [
+        "research_brief",
+        "hypothesis_generation",
+        "hypothesis_review",
+    ]
+    assert tasks[0].status == "completed"
+    assert tasks[1].depends_on == [tasks[0].id]
+    assert tasks[2].depends_on == [tasks[1].id]
+
+
+def test_verification_task_stays_pending_without_plan_and_explicit_approval(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asset = seed_asset(session, investigation)
+    from data.models import Hypothesis
+
+    hypothesis = Hypothesis(
+        asset_id=asset.id,
+        category="access_control",
+        description="Review access boundary",
+        status="unverified",
+    )
+    session.add(hypothesis)
+    session.flush()
+    task = create_task(
+        investigation.id,
+        session,
+        kind="verification",
+        title="Verify reviewed hypothesis",
+        params={"hypothesis_id": hypothesis.id},
+    )
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("verification must remain gated")
+
+    monkeypatch.setattr(cycle, "run_task", must_not_run)
+    report = cycle.run_supervised_cycle(investigation.id, session, execute=True)
+
+    assert task.status == "pending"
+    assert report.executed == []
+    assert [item.reason for item in report.skipped] == ["verification_plan_required"]
+
+    mismatched = cycle.run_supervised_cycle(
+        investigation.id,
+        session,
+        execute=True,
+        verification_plan=type("BoundPlan", (), {"hypothesis_id": hypothesis.id + 1})(),
+        approve_verification=True,
+    )
+    assert task.status == "pending"
+    assert [item.reason for item in mismatched.skipped] == ["verification_plan_mismatch"]
+
+
+def test_one_approval_runs_at_most_one_verification_task(
+    session: Session, investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from data.models import Hypothesis
+
+    asset = seed_asset(session, investigation)
+    hypotheses = [
+        Hypothesis(
+            asset_id=asset.id,
+            category="access_control",
+            description=f"hypothesis {index}",
+            status="unverified",
+        )
+        for index in (1, 2)
+    ]
+    session.add_all(hypotheses)
+    session.flush()
+    tasks = [
+        create_task(
+            investigation.id,
+            session,
+            kind="verification",
+            title=f"verify {index}",
+            params={"hypothesis_id": hypothesis.id},
+        )
+        for index, hypothesis in enumerate(hypotheses, start=1)
+    ]
+
+    def fake_run(task_id, active_session, **kwargs):
+        start_task(task_id, active_session)
+        complete_task(task_id, active_session, final_status="completed")
+
+    monkeypatch.setattr(cycle, "run_task", fake_run)
+    report = cycle.run_supervised_cycle(
+        investigation.id,
+        session,
+        execute=True,
+        verification_plan=type("BoundPlan", (), {"hypothesis_id": hypotheses[0].id})(),
+        approve_verification=True,
+    )
+
+    assert len(report.executed) == 1
+    assert report.executed[0].task_id == tasks[0].id
+    assert tasks[0].status == "completed"
+    assert tasks[1].status == "pending"
 
 
 def test_not_running_investigation_refuses_execute(

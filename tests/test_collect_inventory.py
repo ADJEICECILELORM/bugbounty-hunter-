@@ -38,7 +38,7 @@ def session() -> Any:
 def _program(session: Session) -> Program:
     program = Program(
         name="Example Program",
-        authorized_scope=["*.example.test"],
+        authorized_scope=["example.test", "*.example.test"],
         excluded_scope=[],
         rate_limit=30,
     )

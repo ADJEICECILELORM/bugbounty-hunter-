@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, UniqueConstraint, event
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    JSON,
+    String,
+    UniqueConstraint,
+    event,
+    insert,
+    inspect as sa_inspect,
+    select,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 
@@ -21,6 +36,7 @@ class Program(Base):
     authorized_scope: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     excluded_scope: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     rate_limit: Mapped[int] = mapped_column(nullable=False)
+    required_request_headers: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
@@ -89,6 +105,10 @@ class Task(Base):
     result_summary: Mapped[str | None] = mapped_column(String(2000))
     depends_on: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    # Stable optional key used by deterministic planners to prevent duplicate
+    # task creation across concurrent sessions. NULL remains unrestricted for
+    # operator-created tasks.
+    dedupe_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     investigation: Mapped[Investigation] = relationship(
         back_populates="tasks", passive_deletes="all"
@@ -96,6 +116,12 @@ class Task(Base):
     events: Mapped[list[TaskEvent]] = relationship(
         back_populates="task", order_by="TaskEvent.id", passive_deletes="all"
     )
+    evidence_links: Mapped[list[TaskObservation]] = relationship(
+        back_populates="task", passive_deletes="all"
+    )
+
+
+Index("uq_tasks_dedupe_key", Task.dedupe_key, unique=True)
 
 
 class TaskEvent(Base):
@@ -211,6 +237,176 @@ class Observation(Base):
     )
     provenance: Mapped[ObservationProvenance | None] = relationship(
         back_populates="observation", uselist=False, passive_deletes="all"
+    )
+    task_links: Mapped[list[TaskObservation]] = relationship(
+        back_populates="observation", passive_deletes="all"
+    )
+    fingerprint_record: Mapped[ObservationFingerprint | None] = relationship(
+        back_populates="observation",
+        foreign_keys="ObservationFingerprint.observation_id",
+        uselist=False,
+        passive_deletes="all",
+    )
+
+
+class TaskObservation(Base):
+    """Task-to-evidence provenance link.
+
+    Links are append-only audit metadata: they record that a task produced or
+    consumed some evidence row without altering the evidence itself. Keeping the
+    link as a distinct table preserves a complete chain of custody while allowing
+    multiple tasks to reference the same observation and multiple observations to
+    belong to the same task.
+    """
+
+    __tablename__ = "task_observations"
+    __table_args__ = (
+        UniqueConstraint("task_id", "observation_id", "role"),
+        CheckConstraint("role IN ('input', 'output')"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    observation_id: Mapped[int] = mapped_column(
+        ForeignKey("observations.id", ondelete="RESTRICT"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    task: Mapped[Task] = relationship(back_populates="evidence_links", passive_deletes="all")
+    observation: Mapped[Observation] = relationship(
+        back_populates="task_links", passive_deletes="all"
+    )
+
+
+class ObservationFingerprint(Base):
+    """Immutable identity digest and exact-duplicate pointer for one observation."""
+
+    __tablename__ = "observation_fingerprints"
+    __table_args__ = (
+        Index("ix_observation_fingerprints_fingerprint", "fingerprint"),
+    )
+
+    observation_id: Mapped[int] = mapped_column(
+        ForeignKey("observations.id", ondelete="RESTRICT"), primary_key=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    duplicate_of_observation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("observations.id", ondelete="RESTRICT"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    observation: Mapped[Observation] = relationship(
+        back_populates="fingerprint_record",
+        foreign_keys=[observation_id],
+        passive_deletes="all",
+    )
+
+
+def observation_identity_payload(
+    *,
+    observation_type: str,
+    asset_id: int,
+    hypothesis_id: int | None,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": "observation-identity-v1",
+        "observation_type": observation_type,
+        "asset_id": asset_id,
+        "hypothesis_id": hypothesis_id,
+        "data": data,
+    }
+
+
+def canonical_observation_identity(
+    *,
+    observation_type: str,
+    asset_id: int,
+    hypothesis_id: int | None,
+    data: dict[str, Any],
+) -> bytes:
+    return json.dumps(
+        observation_identity_payload(
+            observation_type=observation_type,
+            asset_id=asset_id,
+            hypothesis_id=hypothesis_id,
+            data=data,
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def observation_identity_fingerprint(
+    *,
+    observation_type: str,
+    asset_id: int,
+    hypothesis_id: int | None,
+    data: dict[str, Any],
+) -> str:
+    return hashlib.sha256(
+        canonical_observation_identity(
+            observation_type=observation_type,
+            asset_id=asset_id,
+            hypothesis_id=hypothesis_id,
+            data=data,
+        )
+    ).hexdigest()
+
+
+@event.listens_for(Observation, "after_insert")
+def _record_observation_fingerprint(
+    _mapper: Any, connection: Any, observation: Observation
+) -> None:
+    identity = canonical_observation_identity(
+        observation_type=observation.observation_type,
+        asset_id=observation.asset_id,
+        hypothesis_id=observation.hypothesis_id,
+        data=observation.data,
+    )
+    fingerprint = hashlib.sha256(identity).hexdigest()
+    fingerprint_table = ObservationFingerprint.__table__
+    candidate_ids = connection.execute(
+        select(fingerprint_table.c.observation_id).where(
+            fingerprint_table.c.fingerprint == fingerprint
+        ).order_by(fingerprint_table.c.observation_id)
+    ).scalars()
+    duplicate_of_id = None
+    for candidate_id in candidate_ids:
+        candidate = connection.execute(
+            select(
+                Observation.id,
+                Observation.observation_type,
+                Observation.asset_id,
+                Observation.hypothesis_id,
+                Observation.data,
+            ).where(Observation.id == candidate_id)
+        ).one()
+        candidate_identity = canonical_observation_identity(
+            observation_type=candidate.observation_type,
+            asset_id=candidate.asset_id,
+            hypothesis_id=candidate.hypothesis_id,
+            data=candidate.data,
+        )
+        if candidate_identity == identity:
+            duplicate_of_id = candidate.id
+            break
+    connection.execute(
+        insert(fingerprint_table).values(
+            observation_id=observation.id,
+            fingerprint=fingerprint,
+            duplicate_of_observation_id=duplicate_of_id,
+            created_at=datetime.now(UTC),
+        )
     )
 
 
@@ -363,13 +559,31 @@ class ObservationProvenance(Base):
 
 
 class HistoricalRecordIsImmutable(Exception):
-    """Raised when an ORM operation attempts to delete retained history."""
+    """Raised when an ORM operation attempts to change retained history."""
+
+
+class InvalidObservationError(ValueError):
+    """Raised when a new observation is not a valid JSON evidence record."""
+
+
+def _has_only_string_json_object_keys(value: Any) -> bool:
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str)
+            and _has_only_string_json_object_keys(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return all(_has_only_string_json_object_keys(item) for item in value)
+    return True
 
 
 _RETAINED_RECORD_TYPES = (
     Observation,
     ObservationProvenance,
     HypothesisSupportingObservation,
+    TaskObservation,
+    ObservationFingerprint,
     Verdict,
     Finding,
     TaskEvent,
@@ -381,9 +595,37 @@ _RETAINED_RECORD_TABLES = {
 
 
 @event.listens_for(Session, "before_flush")
-def _refuse_historical_record_deletion(
+def _refuse_historical_record_mutation(
     session: Session, _flush_context: Any, _instances: Any
 ) -> None:
+    for instance in session.new:
+        if not isinstance(instance, Observation):
+            continue
+        if (
+            not isinstance(instance.observation_type, str)
+            or not instance.observation_type.strip()
+            or len(instance.observation_type) > 64
+        ):
+            raise InvalidObservationError(
+                "Observation type must be a non-empty string of at most 64 characters"
+            )
+        if not isinstance(instance.data, dict) or any(
+            not isinstance(key, str) for key in instance.data
+        ):
+            raise InvalidObservationError(
+                "Observation data must be a mapping with string keys"
+            )
+        if not _has_only_string_json_object_keys(instance.data):
+            raise InvalidObservationError(
+                "Observation data must use string keys in every JSON object"
+            )
+        try:
+            json.dumps(instance.data, allow_nan=False)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise InvalidObservationError(
+                "Observation data must contain only finite JSON-compatible values"
+            ) from error
+
     for instance in session.deleted:
         if isinstance(instance, TaskEvent):
             raise TaskEventIsAppendOnly(
@@ -392,6 +634,21 @@ def _refuse_historical_record_deletion(
         if isinstance(instance, _RETAINED_RECORD_TYPES):
             raise HistoricalRecordIsImmutable(
                 f"{type(instance).__name__} records are retained and cannot be deleted"
+            )
+    for instance in session.dirty:
+        state = sa_inspect(instance)
+        if not any(
+            state.attrs[attribute.key].history.has_changes()
+            for attribute in state.mapper.column_attrs
+        ):
+            continue
+        if isinstance(instance, TaskEvent):
+            raise TaskEventIsAppendOnly(
+                f"TaskEvent {instance.id} is append-only"
+            )
+        if isinstance(instance, _RETAINED_RECORD_TYPES):
+            raise HistoricalRecordIsImmutable(
+                f"{type(instance).__name__} records are retained and cannot be updated"
             )
 
 

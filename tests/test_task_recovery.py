@@ -21,8 +21,8 @@ from typing import Any
 import pytest
 from sqlalchemy.orm import Session
 
-from data.db import init_db
-from data.models import Asset, Investigation, Program, Task
+from data.db import create_database_engine, init_db, initialize_fresh_database
+from data.models import Asset, Investigation, Program, Task, TaskEvent
 from verification.investigation_lifecycle import start_investigation
 from verification.investigation_tasks import (
     PENDING,
@@ -172,6 +172,139 @@ def test_mark_task_failed_after_crash_refuses_a_blank_reason(
     assert task.status == RUNNING
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Authorization: Bearer test-secret",
+        "password=hunter2",
+        "https://user:secret@example.test/path",
+        "x" * 501,
+    ],
+)
+def test_mark_task_failed_after_crash_does_not_persist_sensitive_reason(
+    session: Session, investigation: Investigation, reason: str
+) -> None:
+    task = create_task(investigation.id, session, kind="recon", title="x")
+    start_task(task.id, session)
+
+    with pytest.raises(ValueError, match="non-sensitive description") as error:
+        mark_task_failed_after_crash(task.id, session, reason=reason)
+
+    assert reason not in str(error.value)
+    assert task.status == RUNNING
+    assert task.result_summary is None
+    assert [event.event_type for event in task.events] == ["created", "started"]
+
+
+def test_competing_stale_sessions_cannot_start_one_task_twice(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'atomic-task-start.db'}"
+    )
+    initialize_fresh_database(engine)
+    with Session(engine) as setup:
+        program = Program(
+            name="atomic start", authorized_scope=["example.test"],
+            excluded_scope=[], rate_limit=1,
+        )
+        setup.add(program)
+        setup.flush()
+        investigation = start_investigation(program.id, setup)
+        task = create_task(investigation.id, setup, kind="report", title="once")
+        task_id = task.id
+        setup.commit()
+
+    first = Session(engine)
+    second = Session(engine)
+    try:
+        assert first.get(Task, task_id).status == PENDING
+        stale = second.get(Task, task_id)
+        assert stale.status == PENDING
+        start_task(task_id, first)
+        first.commit()
+
+        with pytest.raises(ValueError, match="'running'"):
+            start_task(task_id, second)
+        assert stale.status == RUNNING
+        second.commit()
+        with Session(engine) as check:
+            events = check.query(TaskEvent).filter_by(task_id=task_id).all()
+            assert [event.event_type for event in events].count("started") == 1
+    finally:
+        first.close()
+        second.close()
+        engine.dispose()
+
+
+def test_durable_dispatch_start_is_recoverable_after_process_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import orchestration.task_runner as runner
+
+    engine = create_database_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'durable-dispatch.db'}"
+    )
+    initialize_fresh_database(engine)
+    with Session(engine) as setup:
+        program = Program(
+            name="durable dispatch", authorized_scope=["api.example.test"],
+            excluded_scope=[], rate_limit=1,
+        )
+        setup.add(program)
+        setup.flush()
+        investigation = start_investigation(program.id, setup)
+        asset = Asset(investigation_id=investigation.id, hostname="api.example.test")
+        setup.add(asset)
+        setup.flush()
+        task = create_task(
+            investigation.id,
+            setup,
+            kind="inventory",
+            title="collect",
+            params={"asset_id": asset.id, "base_url": "https://api.example.test/"},
+        )
+        task_id = task.id
+        investigation_id = investigation.id
+        setup.commit()
+
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    def crash_after_durable_start(*args: object, session: Session, **kwargs: object):
+        with Session(engine) as observer:
+            durable_task = observer.get(Task, task_id)
+            assert durable_task.status == RUNNING
+            assert [event.event_type for event in durable_task.events] == [
+                "created", "started", "dispatched"
+            ]
+        raise SimulatedProcessExit()
+
+    monkeypatch.setattr(runner, "collect_seed_inventory", crash_after_durable_start)
+    try:
+        with Session(engine) as active:
+            with pytest.raises(SimulatedProcessExit):
+                runner.run_task(
+                    task_id,
+                    active,
+                    authorize=lambda _url: True,
+                    commit_before_dispatch=True,
+                )
+        with Session(engine) as recovered:
+            assert find_stuck_tasks(
+                    investigation_id, recovered, running_longer_than_seconds=0
+            )
+            mark_task_failed_after_crash(
+                task_id, recovered, reason="process interrupted before completion"
+            )
+            retry = create_retry_task(task_id, recovered)
+            recovered.commit()
+            assert retry.status == PENDING
+            assert retry.dedupe_key == f"retry:v1:{task_id}"
+    finally:
+        engine.dispose()
+
+
 # --- create_retry_task -----------------------------------------------------
 
 
@@ -258,6 +391,26 @@ def test_create_retry_task_refuses_a_second_retry(
     assert first.status == PENDING
 
 
+def test_retry_creation_rolls_back_task_when_audit_link_fails(
+    session: Session, investigation: Investigation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import verification.task_recovery as recovery
+
+    original = create_task(investigation.id, session, kind="report", title="retry atomically")
+    start_task(original.id, session)
+    complete_task(original.id, session, final_status="failed")
+    task_count = session.query(Task).count()
+
+    def fail_retry_audit(*_args, **_kwargs):
+        raise RuntimeError("audit link failed")
+
+    monkeypatch.setattr(recovery, "append_task_event", fail_retry_audit)
+    with pytest.raises(RuntimeError, match="audit link failed"):
+        create_retry_task(original.id, session)
+
+    assert session.query(Task).count() == task_count
+    assert not any(event.event_type == "retry_created" for event in original.events)
+
 def test_create_retry_task_rejects_a_missing_task(session: Session) -> None:
     with pytest.raises(LookupError, match="Task 4242 does not exist"):
         create_retry_task(4242, session)
@@ -301,7 +454,9 @@ def test_recovery_module_imports_only_the_session_and_task_layers() -> None:
     assert imported == {
         "__future__",
         "datetime",
+        "re",
         "sqlalchemy",
+        "sqlalchemy.exc",
         "sqlalchemy.orm",
         "data.models",
         "verification.investigation_tasks",

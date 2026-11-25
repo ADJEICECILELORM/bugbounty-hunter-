@@ -39,7 +39,7 @@ def session() -> Any:
 def program_id(session: Session) -> int:
     program = Program(
         name="Example Program",
-        authorized_scope=["*.example.test"],
+        authorized_scope=["example.test", "*.example.test"],
         excluded_scope=[],
         rate_limit=30,
     )
